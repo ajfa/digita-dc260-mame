@@ -1,0 +1,2237 @@
+From d2e5115d62fd9ee32f823fb533e7672dcc0eb84b Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 00:06:09 -0600
+Subject: [PATCH] dc260: Kodak DC260 (Digita) driver, MPC823 support in the
+ PowerPC core
+
+---
+ src/devices/cpu/powerpc/ppc.h      |  29 +-
+ src/devices/cpu/powerpc/ppccom.cpp | 162 ++++-
+ src/devices/cpu/powerpc/ppccom.h   |  40 +-
+ src/devices/cpu/powerpc/ppcdrc.cpp |  51 +-
+ src/frontend/mame/ui/ui.cpp        |   2 +-
+ src/mame/kodak/dc260.cpp           | 636 ++++++++++++++++++++
+ src/mame/kodak/mpc823_imm.cpp      | 909 +++++++++++++++++++++++++++++
+ src/mame/kodak/mpc823_imm.h        | 136 +++++
+ src/mame/mame.lst                  |   3 +
+ 9 files changed, 1961 insertions(+), 7 deletions(-)
+ create mode 100644 src/mame/kodak/dc260.cpp
+ create mode 100644 src/mame/kodak/mpc823_imm.cpp
+ create mode 100644 src/mame/kodak/mpc823_imm.h
+
+diff --git a/src/devices/cpu/powerpc/ppc.h b/src/devices/cpu/powerpc/ppc.h
+index edc987f0..713a6230 100644
+--- a/src/devices/cpu/powerpc/ppc.h
++++ b/src/devices/cpu/powerpc/ppc.h
+@@ -218,7 +218,8 @@ protected:
+ 		PPC_MODEL_7457              = 0x80020101,   // "Apollo 7", version 1.1
+ 		PPC_MODEL_MPC8240           = 0x00810101,   // "Kahlua"
+ 		PPC_MODEL_MPC8241           = 0x80811014,   // "Kahlua Lt"
+-		PPC_MODEL_MPC8245           = 0x80811014    // "Kahlua II"
++		PPC_MODEL_MPC8245           = 0x80811014,   // "Kahlua II"
++		PPC_MODEL_MPC823            = 0x00500000    // MPC8xx embedded core
+ 	};
+ 
+ 	// construction/destruction
+@@ -328,6 +329,11 @@ protected:
+ 		EXCEPTION_ITLBMISS      = 16,       // PPCCAP_603_MMU
+ 		EXCEPTION_DTLBMISSL     = 17,       // PPCCAP_603_MMU
+ 		EXCEPTION_DTLBMISSS     = 18,       // PPCCAP_603_MMU
++		EXCEPTION_8XX_SWEMU     = 16,       // PPCCAP_8XX
++		EXCEPTION_8XX_ITLBMISS  = 17,       // PPCCAP_8XX
++		EXCEPTION_8XX_DTLBMISS  = 18,       // PPCCAP_8XX
++		EXCEPTION_8XX_ITLBERR   = 19,       // PPCCAP_8XX
++		EXCEPTION_8XX_DTLBERR   = 20,       // PPCCAP_8XX
+ 		EXCEPTION_COUNT
+ 	};
+ 
+@@ -522,6 +528,15 @@ protected:
+ 	uint8_t         m_cache_line_size;
+ 	uint32_t        m_tb_divisor;
+ 
++	// MPC8xx software-loaded TLBs: [0] instruction, [1] data
++	struct tlb8xx_entry
++	{
++		uint32_t epn;
++		uint32_t twc;
++		uint32_t rpn;
++	};
++	tlb8xx_entry m_tlb8xx[2][32];
++
+ 	// PowerPC 4xx-specific state
+ 	// PowerPC 4XX-specific serial port state
+ 	struct ppc4xx_spu_state
+@@ -739,6 +754,10 @@ protected:
+ 	virtual uint32_t get_decrementer();
+ 	virtual void set_decrementer(uint32_t newdec);
+ 	uint32_t ppccom_translate_address_internal(int intention, bool debug, offs_t &address);
++	uint32_t ppc8xx_translate_address(int intention, offs_t &address);
++	void ppc8xx_tlb_load(int side);
++	void ppc8xx_tlb_invalidate(offs_t ea);
++	void ppc8xx_tlb_invalidate_all();
+ 	void ppc4xx_set_irq_line(uint32_t bitmask, int state);
+ 	int ppc4xx_get_irq_line(uint32_t bitmask);
+ 	void ppc4xx_dma_update_irq_states();
+@@ -831,6 +850,13 @@ public:
+ };
+ 
+ 
++class mpc823_device : public ppc_device
++{
++public:
++	mpc823_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
++};
++
++
+ class ppc601_device : public ppc_device
+ {
+ public:
+@@ -913,6 +939,7 @@ DECLARE_DEVICE_TYPE(PPC603E,   ppc603e_device)
+ DECLARE_DEVICE_TYPE(PPC603R,   ppc603r_device)
+ DECLARE_DEVICE_TYPE(PPC604,    ppc604_device)
+ DECLARE_DEVICE_TYPE(MPC8240,   mpc8240_device)
++DECLARE_DEVICE_TYPE(MPC823,    mpc823_device)
+ DECLARE_DEVICE_TYPE(PPC403GA,  ppc403ga_device)
+ DECLARE_DEVICE_TYPE(PPC403GCX, ppc403gcx_device)
+ DECLARE_DEVICE_TYPE(PPC405GP,  ppc405gp_device)
+diff --git a/src/devices/cpu/powerpc/ppccom.cpp b/src/devices/cpu/powerpc/ppccom.cpp
+index 8450b8bd..7cb84239 100644
+--- a/src/devices/cpu/powerpc/ppccom.cpp
++++ b/src/devices/cpu/powerpc/ppccom.cpp
+@@ -217,6 +217,7 @@ DEFINE_DEVICE_TYPE(PPC603E,   ppc603e_device,   "ppc603e",    "IBM PowerPC 603E"
+ DEFINE_DEVICE_TYPE(PPC603R,   ppc603r_device,   "ppc603r",    "IBM PowerPC 603R")
+ DEFINE_DEVICE_TYPE(PPC604,    ppc604_device,    "ppc604",     "IBM PowerPC 604")
+ DEFINE_DEVICE_TYPE(MPC8240,   mpc8240_device,   "mpc8240",    "IBM PowerPC MPC8240")
++DEFINE_DEVICE_TYPE(MPC823,    mpc823_device,    "mpc823",     "Motorola MPC823")
+ DEFINE_DEVICE_TYPE(PPC403GA,  ppc403ga_device,  "ppc403ga",   "IBM PowerPC 403GA")
+ DEFINE_DEVICE_TYPE(PPC403GCX, ppc403gcx_device, "ppc403gcx",  "IBM PowerPC 403GCX")
+ DEFINE_DEVICE_TYPE(PPC405GP,  ppc405gp_device,  "ppc405gp",   "IBM PowerPC 405GP")
+@@ -293,6 +294,11 @@ mpc8240_device::mpc8240_device(const machine_config &mconfig, const char *tag, d
+ {
+ }
+ 
++mpc823_device::mpc823_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
++	: ppc_device(mconfig, MPC823, tag, owner, clock, 32, 32, PPC_MODEL_MPC823, PPCCAP_OEA | PPCCAP_VEA | PPCCAP_MISALIGNED | PPCCAP_8XX, 16, address_map_constructor(), 16)
++{
++}
++
+ ppc601_device::ppc601_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
+ 	: ppc_device(mconfig, PPC601, tag, owner, clock, 32, 64, PPC_MODEL_601, PPCCAP_OEA | PPCCAP_VEA | PPCCAP_FPU | PPCCAP_MISALIGNED | PPCCAP_MFIOC | PPCCAP_601BAT | PPCCAP_LEGACY_POWER, 0 /* no TB */, address_map_constructor(), 32)
+ {
+@@ -716,7 +722,7 @@ void ppc_device::device_start()
+ 	m_cache_line_size = 32;
+ 	m_cpu_clock = clock();
+ 	m_program = &space(AS_PROGRAM);
+-	if(m_cap & PPCCAP_4XX)
++	if(m_program_config.data_width() == 32)
+ 	{
+ 		m_program->cache(m_cache32);
+ 		m_pr32 = [this](offs_t address) -> u32 { return m_cache32.read_dword(address); };
+@@ -745,7 +751,7 @@ void ppc_device::device_start()
+ 	m_dcr_read_func.set(nullptr);
+ 	m_dcr_write_func.set(nullptr);
+ 
+-	m_tb_divisor = (m_tb_divisor * clock() + m_system_clock / 2 - 1) / m_system_clock;
++	m_tb_divisor = (uint64_t(m_tb_divisor) * clock() + m_system_clock / 2 - 1) / m_system_clock;
+ 
+ 	m_serial_clock = c_serial_clock != 0 ? c_serial_clock : 3'686'400; // TODO: get rid of this hard-coded magic number
+ 	if (m_serial_clock > m_system_clock / 2)
+@@ -805,6 +811,8 @@ void ppc_device::device_start()
+ 		save_item(NAME(m_core->mmu603_key));
+ 		save_item(NAME(m_core->mmu603_r));
+ 	}
++	if (m_cap & PPCCAP_8XX)
++		save_pointer(reinterpret_cast<uint32_t *>(&m_tlb8xx[0][0]), "m_tlb8xx", sizeof(m_tlb8xx) / sizeof(uint32_t));
+ 	save_item(NAME(m_core->irq_pending));
+ 	save_item(NAME(m_tb_zero_cycles));
+ 	save_item(NAME(m_dec_zero_cycles));
+@@ -984,6 +992,14 @@ void ppc_device::device_start()
+ 			static_generate_exception(EXCEPTION_DTLBMISSL, true,  "exception_dtlb_miss_load");
+ 			static_generate_exception(EXCEPTION_DTLBMISSS, true,  "exception_dtlb_miss_store");
+ 		}
++		if (m_cap & PPCCAP_8XX)
++		{
++			static_generate_exception(EXCEPTION_8XX_SWEMU,    true,  "exception_software_emulation");
++			static_generate_exception(EXCEPTION_8XX_ITLBMISS, true,  "exception_itlb_miss");
++			static_generate_exception(EXCEPTION_8XX_DTLBMISS, true,  "exception_dtlb_miss");
++			static_generate_exception(EXCEPTION_8XX_ITLBERR,  true,  "exception_itlb_error");
++			static_generate_exception(EXCEPTION_8XX_DTLBERR,  true,  "exception_dtlb_error");
++		}
+ 
+ 		// add the shared floating-point status-flag finalizer
+ 		static_generate_fpscr_finish();
+@@ -1281,6 +1297,13 @@ void ppc_device::device_reset()
+ 		}
+ 	}
+ 
++	if (m_cap & PPCCAP_8XX)
++	{
++		ppc8xx_tlb_invalidate_all();
++		m_core->spr[SPR8XX_IMMR] = 0xff002010;
++		m_core->spr[SPR8XX_MI_CTR] = m_core->spr[SPR8XX_MD_CTR] = 0;
++	}
++
+ 	/* Mark the cache dirty */
+ 	m_core->mode = 0;
+ 	m_cache_dirty = true;
+@@ -1357,6 +1380,9 @@ uint32_t ppc_device::ppccom_translate_address_internal(int intention, bool debug
+ 	if (!(m_cap & PPCCAP_OEA))
+ 		return 0x001;
+ 
++	if (m_cap & PPCCAP_8XX)
++		return ppc8xx_translate_address(intention, address);
++
+ 	/* also no translation necessary if translation is disabled */
+ 	if ((transtype == TR_FETCH && (m_core->msr & MSROEA_IR) == 0) || (transtype != TR_FETCH && (m_core->msr & MSROEA_DR) == 0))
+ 		return 0x001;
+@@ -1533,6 +1559,71 @@ uint32_t ppc_device::ppccom_translate_address_internal(int intention, bool debug
+ }
+ 
+ 
++/*-------------------------------------------------
++    MPC8xx MMU: the TLBs are only ever loaded by
++    software through Mx_EPN/Mx_TWC/Mx_RPN, so the
++    translation is a search of those entries
++-------------------------------------------------*/
++
++static uint32_t ppc8xx_page_mask(uint32_t twc, uint32_t rpn)
++{
++	switch ((twc >> 2) & 3)
++	{
++		case 1:  return 0xfff80000;                             // 512K
++		case 3:  return 0xff800000;                             // 8M
++		default: return (rpn & 0x8) ? 0xffffc000 : 0xfffff000;  // 16K or 4K
++	}
++}
++
++uint32_t ppc_device::ppc8xx_translate_address(int intention, offs_t &address)
++{
++	int const transtype = intention & TR_TYPE;
++	if ((transtype == TR_FETCH && !(m_core->msr & MSROEA_IR)) || (transtype != TR_FETCH && !(m_core->msr & MSROEA_DR)))
++		return 0x001;
++
++	int const side = (transtype == TR_FETCH) ? 0 : 1;
++	for (auto const &e : m_tlb8xx[side])
++	{
++		if (!(e.epn & 0x200) || !(e.rpn & 1))
++			continue;
++		uint32_t const mask = ppc8xx_page_mask(e.twc, e.rpn);
++		if ((address & mask) == (e.epn & mask))
++		{
++			address = (e.rpn & mask) | (address & ~mask);
++			return 0x001;
++		}
++	}
++	return DSISR_NOT_FOUND | ((transtype == TR_WRITE) ? DSISR_STORE : 0);
++}
++
++void ppc_device::ppc8xx_tlb_load(int side)
++{
++	uint32_t const ctr = m_core->spr[side ? SPR8XX_MD_CTR : SPR8XX_MI_CTR];
++	tlb8xx_entry &e = m_tlb8xx[side][(ctr >> 8) & 0x1f];
++	e.epn = m_core->spr[side ? SPR8XX_MD_EPN : SPR8XX_MI_EPN] | 0x200;
++	e.twc = m_core->spr[side ? SPR8XX_MD_TWC : SPR8XX_MI_TWC];
++	e.rpn = m_core->param1;
++	vtlb_flush_dynamic();
++	if (m_core->m_codepage_any)
++		m_core->m_translation_generation++;
++}
++
++void ppc_device::ppc8xx_tlb_invalidate(offs_t ea)
++{
++	for (auto &side : m_tlb8xx)
++		for (auto &e : side)
++			if ((e.epn & 0x200) && ((ea ^ e.epn) & ppc8xx_page_mask(e.twc, e.rpn)) == 0)
++				e.epn &= ~0x200;
++}
++
++void ppc_device::ppc8xx_tlb_invalidate_all()
++{
++	for (auto &side : m_tlb8xx)
++		for (auto &e : side)
++			e = tlb8xx_entry{ 0, 0, 0 };
++}
++
++
+ /*-------------------------------------------------
+     ppccom_translate_address - translate an address
+     from logical to physical
+@@ -1802,6 +1893,9 @@ void ppc_device::ppccom_dcbz_check()
+ 
+ void ppc_device::ppccom_execute_tlbie()
+ {
++	if (m_cap & PPCCAP_8XX)
++		ppc8xx_tlb_invalidate(m_core->param0);
++
+ 	// The 603/604/750 TLBs are indexed by the low bits of the effective page index alone
+ 	// (EA[15-19] on the 603, EA[14-19] on the 750), so tlbie invalidates that whole class.
+ 	// Mac OS X aliases user pages through its copyin/copyout window and expects the tlbie
+@@ -1834,6 +1928,9 @@ void ppc_device::ppccom_execute_tlbie()
+ 
+ void ppc_device::ppccom_execute_tlbia()
+ {
++	if (m_cap & PPCCAP_8XX)
++		ppc8xx_tlb_invalidate_all();
++
+ 	vtlb_flush_dynamic();
+ 
+ 	// Any page's translation may be changing.  If any code is compiled, make
+@@ -2035,6 +2132,34 @@ void ppc_device::ppccom_execute_mfspr()
+ 		}
+ 	}
+ 
++	/* handle 8XX SPRs */
++	if (m_cap & PPCCAP_8XX)
++	{
++		switch (m_core->param0)
++		{
++			case SPR603_TBL_R:
++				m_core->param1 = get_timebase();
++				return;
++			case SPR603_TBU_R:
++				m_core->param1 = get_timebase() >> 32;
++				return;
++
++			// the cache and TLB read-back ports are not modelled
++			case SPR8XX_IC_CST:
++			case SPR8XX_DC_CST:
++			case SPR8XX_IC_DAT:
++			case SPR8XX_DC_DAT:
++			case SPR8XX_MI_RAM0:
++			case SPR8XX_MI_RAM1:
++			case SPR8XX_MD_RAM0:
++			case SPR8XX_MD_RAM1:
++				m_core->param1 = 0;
++				return;
++		}
++		m_core->param1 = m_core->spr[m_core->param0];
++		return;
++	}
++
+ 	/* handle 4XX SPRs */
+ 	if (m_cap & PPCCAP_4XX)
+ 	{
+@@ -2254,6 +2379,39 @@ void ppc_device::ppccom_execute_mtspr()
+ 		}
+ 	}
+ 
++	/* handle 8XX SPRs */
++	if (m_cap & PPCCAP_8XX)
++	{
++		switch (m_core->param0)
++		{
++			case SPR603_TBL_W:
++				set_timebase((get_timebase() & ~u64(0x00000000ffffffffU)) | m_core->param1);
++				return;
++			case SPR603_TBU_W:
++				set_timebase((get_timebase() & ~u64(0xffffffff00000000U)) | ((uint64_t)m_core->param1 << 32));
++				return;
++
++			case SPR8XX_MI_RPN:
++				ppc8xx_tlb_load(0);
++				return;
++			case SPR8XX_MD_RPN:
++				ppc8xx_tlb_load(1);
++				return;
++
++			case SPR8XX_IMMR:
++				m_core->spr[SPR8XX_IMMR] = (m_core->param1 & 0xffff0000) | (m_core->spr[SPR8XX_IMMR] & 0x0000ffff);
++				return;
++
++			case SPR8XX_IC_CST:
++				// invalidate-all and unlock-all commands
++				if (((m_core->param1 >> 25) & 7) == 6 && m_core->m_codepage_any)
++					invalidate_code_range(0, 0xffffffff);
++				return;
++		}
++		m_core->spr[m_core->param0] = m_core->param1;
++		return;
++	}
++
+ 	/* handle 4XX SPRs */
+ 	if (m_cap & PPCCAP_4XX)
+ 	{
+diff --git a/src/devices/cpu/powerpc/ppccom.h b/src/devices/cpu/powerpc/ppccom.h
+index 705153df..7ccca2ed 100644
+--- a/src/devices/cpu/powerpc/ppccom.h
++++ b/src/devices/cpu/powerpc/ppccom.h
+@@ -73,6 +73,7 @@
+ #define PPCCAP_604_MMU              0x100       // TRUE if we have 604-class MMU features
+ #define PPCCAP_750_TLB              0x200       // TRUE if we have the extended 740/750 series TLB
+ #define PPCCAP_LEGACY_POWER         0x400       // TRUE if we support the legacy POWER instructions
++#define PPCCAP_8XX                  0x800       // TRUE if we are an MPC8xx embedded core (software TLB, no FPU)
+ 
+ // exception types
+ enum
+@@ -93,6 +94,11 @@ enum
+ 	EXCEPTION_ITLBMISS      = 16,       // PPCCAP_603_MMU
+ 	EXCEPTION_DTLBMISSL     = 17,       // PPCCAP_603_MMU
+ 	EXCEPTION_DTLBMISSS     = 18,       // PPCCAP_603_MMU
++	EXCEPTION_8XX_SWEMU     = 16,       // PPCCAP_8XX
++	EXCEPTION_8XX_ITLBMISS  = 17,       // PPCCAP_8XX
++	EXCEPTION_8XX_DTLBMISS  = 18,       // PPCCAP_8XX
++	EXCEPTION_8XX_ITLBERR   = 19,       // PPCCAP_8XX
++	EXCEPTION_8XX_DTLBERR   = 20,       // PPCCAP_8XX
+ 	EXCEPTION_COUNT
+ };
+ 
+@@ -211,7 +217,39 @@ enum
+ 	SPR603_HID0         = 0x3f0,    // R/W 603 Hardware Implementation Register 0
+ 	SPR603_HID1         = 0x3f1,    // R/W 603 Hardware Implementation Register 1
+ 	SPR603_IABR         = 0x3f2,    // R/W 603 Instruction Address Breakpoint Register
+-	SPR603_HID2         = 0x3f3     // R/W 603
++	SPR603_HID2         = 0x3f3,    // R/W 603
++
++	// MPC8xx SPR register indexes
++	SPR8XX_EIE          = 0x050,    // W   8xx set MSR[EE] and MSR[RI]
++	SPR8XX_EID          = 0x051,    // W   8xx clear MSR[EE], set MSR[RI]
++	SPR8XX_NRI          = 0x052,    // W   8xx clear MSR[EE] and MSR[RI]
++	SPR8XX_IC_CST       = 0x230,    // R/W 8xx instruction cache control and status
++	SPR8XX_IC_ADR       = 0x231,
++	SPR8XX_IC_DAT       = 0x232,
++	SPR8XX_DC_CST       = 0x238,    // R/W 8xx data cache control and status
++	SPR8XX_DC_ADR       = 0x239,
++	SPR8XX_DC_DAT       = 0x23a,
++	SPR8XX_DPDR         = 0x276,
++	SPR8XX_IMMR         = 0x27e,    // R/W 8xx internal memory map register
++	SPR8XX_MI_CTR       = 0x310,    // R/W 8xx instruction MMU control
++	SPR8XX_MI_AP        = 0x312,
++	SPR8XX_MI_EPN       = 0x313,
++	SPR8XX_MI_TWC       = 0x315,
++	SPR8XX_MI_RPN       = 0x316,
++	SPR8XX_MD_CTR       = 0x318,    // R/W 8xx data MMU control
++	SPR8XX_M_CASID      = 0x319,
++	SPR8XX_MD_AP        = 0x31a,
++	SPR8XX_MD_EPN       = 0x31b,
++	SPR8XX_M_TWB        = 0x31c,
++	SPR8XX_MD_TWC       = 0x31d,
++	SPR8XX_MD_RPN       = 0x31e,
++	SPR8XX_M_TW         = 0x31f,
++	SPR8XX_MI_CAM       = 0x330,
++	SPR8XX_MI_RAM0      = 0x331,
++	SPR8XX_MI_RAM1      = 0x332,
++	SPR8XX_MD_CAM       = 0x338,
++	SPR8XX_MD_RAM0      = 0x339,
++	SPR8XX_MD_RAM1      = 0x33a
+ };
+ 
+ // PowerPC 4XX DCR register indexes
+diff --git a/src/devices/cpu/powerpc/ppcdrc.cpp b/src/devices/cpu/powerpc/ppcdrc.cpp
+index 39ba9b79..d77f4411 100644
+--- a/src/devices/cpu/powerpc/ppcdrc.cpp
++++ b/src/devices/cpu/powerpc/ppcdrc.cpp
+@@ -936,6 +936,11 @@ void ppc_device::static_generate_tlb_mismatch()
+ 	alloc_handle(m_drcuml.get(), &m_exception[EXCEPTION_ISI], "exception_isi");
+ 	if (m_cap & PPCCAP_603_MMU)
+ 		alloc_handle(m_drcuml.get(), &m_exception[EXCEPTION_ITLBMISS], "exception_itlb_miss");
++	if (m_cap & PPCCAP_8XX)
++	{
++		alloc_handle(m_drcuml.get(), &m_exception[EXCEPTION_8XX_ITLBMISS], "exception_itlb_miss");
++		alloc_handle(m_drcuml.get(), &m_exception[EXCEPTION_8XX_ITLBERR], "exception_itlb_error");
++	}
+ 
+ 	// begin generating
+ 	drcuml_block &block(m_drcuml->begin_invariant_block(20));
+@@ -974,7 +979,17 @@ void ppc_device::static_generate_tlb_mismatch()
+ 	UML_CALLC(block, cfunc_ppccom_get_dsisr, this);                         // get reason to param1
+ 	UML_MOV(block, I1, mem(&m_core->param1));                               // mov     i1,[param1]
+ 	UML_AND(block, I1, I1, DSISR_NOT_FOUND | DSISR_PROTECTED | DSISR_NOEXEC);   // keep the SRR1 ISI reason bits
+-	if (!(m_cap & PPCCAP_603_MMU))
++	if (m_cap & PPCCAP_8XX)
++	{
++		// the 8xx has no ISI: a fetch with no TLB entry is an ITLB miss, anything else an ITLB error
++		UML_TEST(block, I1, DSISR_PROTECTED | DSISR_NOEXEC);                    // test    i1,protected|noexec
++		UML_JMPc(block, COND_Z, itlbmiss = label++);                            // jmp     itlbmiss,z
++		UML_EXH(block, *m_exception[EXCEPTION_8XX_ITLBERR], I0);                // exh     itlberr,i0
++		UML_LABEL(block, itlbmiss);                                             // itlbmiss:
++		UML_AND(block, SPR32(SPR8XX_MI_EPN), I0, 0xfffff000);                   // and     [mi_epn],i0,0xfffff000
++		UML_EXH(block, *m_exception[EXCEPTION_8XX_ITLBMISS], I0);               // exh     itlbmiss,i0
++	}
++	else if (!(m_cap & PPCCAP_603_MMU))
+ 	{
+ 		UML_MOV(block, I0, I1);                                             // mov     i0,i1
+ 		UML_EXH(block, *m_exception[EXCEPTION_ISI], I0);                    // exh     isi,i0
+@@ -1638,6 +1653,20 @@ void ppc_device::static_generate_memory_accessor(
+ 			UML_MOV(block, SPR32(SPR4XX_DEAR), I0);          // mov     [dear],i0
+ 			UML_EXH(block, *m_exception[EXCEPTION_DSI], I0); // exh     dsi,i0
+ 		}
++		else if (m_cap & PPCCAP_8XX)
++		{
++			// 8xx case: no TLB entry is a DTLB miss, a refused access is a DTLB error
++			UML_AND(block, SPR32(SPR8XX_MD_EPN), I0, 0xfffff000);               // and     [md_epn],i0,0xfffff000
++			UML_MOV(block, mem(&m_core->param1), iswrite ? 1 : 0);
++			UML_CALLC(block, cfunc_ppccom_get_dsisr, this);
++			UML_TEST(block, mem(&m_core->param1), DSISR_PROTECTED);
++			UML_JMPc(block, COND_Z, label);
++			UML_MOV(block, SPR32(SPROEA_DAR), I0);                                  // mov [dar],i0
++			UML_MOV(block, SPR32(SPROEA_DSISR), mem(&m_core->param1));
++			UML_EXH(block, *m_exception[EXCEPTION_8XX_DTLBERR], I0);                // exh dtlberr,i0
++			UML_LABEL(block, label++);
++			UML_EXH(block, *m_exception[EXCEPTION_8XX_DTLBMISS], I0);               // exh dtlbmiss,i0
++		}
+ 		else if (m_cap & PPCCAP_603_MMU)
+ 		{
+ 			// 603 case: BAT protection violations raise DSI, otherwise it's a TLB miss
+@@ -2108,7 +2137,11 @@ void ppc_device::generate_sequence_instruction(drcuml_block &block, compiler_sta
+ 	if (desc->invalid_opcode())
+ 	{
+ 		// if this is an invalid opcode, generate the exception now
+-		UML_EXH(block, *m_exception[EXCEPTION_PROGRAM], 0x80000);
++		// (the 8xx traps every unimplemented opcode, floating point included, to software emulation)
++		if (m_cap & PPCCAP_8XX)
++			UML_EXH(block, *m_exception[EXCEPTION_8XX_SWEMU], 0);
++		else
++			UML_EXH(block, *m_exception[EXCEPTION_PROGRAM], 0x80000);
+ 	}
+ 	else if (desc->privileged() && (m_core->mode & MODE_USER))
+ 	{
+@@ -4392,6 +4425,20 @@ bool ppc_device::generate_instruction_1f(drcuml_block &block, compiler_state *co
+ 			}
+ 			else if (spr == SPROEA_PVR)
+ 				;                                                               // read only
++			else if ((m_cap & PPCCAP_8XX) && spr >= SPR8XX_EIE && spr <= SPR8XX_NRI)
++			{
++				// the 8xx interrupt enable shortcuts: EIE sets EE and RI, EID clears EE, NRI clears both
++				if (spr == SPR8XX_EIE)
++					UML_OR(block, MSR32, MSR32, MSR_EE | MSROEA_RI);            // or      msr,msr,EE|RI
++				else if (spr == SPR8XX_EID)
++				{
++					UML_AND(block, MSR32, MSR32, ~MSR_EE);                      // and     msr,msr,~EE
++					UML_OR(block, MSR32, MSR32, MSROEA_RI);                     // or      msr,msr,RI
++				}
++				else
++					UML_AND(block, MSR32, MSR32, ~(MSR_EE | MSROEA_RI));        // and     msr,msr,~(EE|RI)
++				compiler->checkints = true;
++			}
+ 			else
+ 			{
+ 				generate_update_cycles(block, compiler, desc->pc, false);       // <update cycles>
+diff --git a/src/frontend/mame/ui/ui.cpp b/src/frontend/mame/ui/ui.cpp
+index f92c4abb..41c4d823 100644
+--- a/src/frontend/mame/ui/ui.cpp
++++ b/src/frontend/mame/ui/ui.cpp
+@@ -661,7 +661,7 @@ void mame_ui_manager::display_startup_screens(bool first_time)
+ 	const int maxstate = 3;
+ 	int const str = machine().options().seconds_to_run();
+ 	bool show_gameinfo = !machine().options().skip_gameinfo();
+-	bool show_warnings = true;
++	bool show_warnings = !options().skip_warnings();
+ 	bool video_none = strcmp(downcast<osd_options &>(machine().options()).video(), OSDOPTVAL_NONE) == 0;
+ 
+ 	// disable everything if we are using -str for 300 (5 minutes) or fewer seconds, or if we're the empty driver,
+diff --git a/src/mame/kodak/dc260.cpp b/src/mame/kodak/dc260.cpp
+new file mode 100644
+index 00000000..e93b936d
+--- /dev/null
++++ b/src/mame/kodak/dc260.cpp
+@@ -0,0 +1,636 @@
++// license:BSD-3-Clause
++// copyright-holders:ajfa
++/*
++    Kodak DC260 digital camera (Digita operating environment)
++
++    Motorola MPC823 @ 49.152 MHz (PLL from a 32.768 kHz crystal)
++    8 MB DRAM, 2 MB flash (16-bit), CompactFlash through the PCMCIA controller
++    VxWorks 5.3 with FlashPoint's Digita on top
++
++    Memory map, as programmed by romInit:
++      00000000-007fffff  DRAM (CS1, CS2)
++      00810000-00817fff  camera ASIC (CS3)
++      02000000-          PCMCIA window
++      ff000000-ff003fff  MPC823 internal registers
++      ffe00000-ffefffff  flash: resources ("rsrc")
++      fff00000-ffffffff  flash: boot code and compressed VxWorks image
++
++    The flash contents come from the camera's own update files:
++    flshrsrc.bin is written at ffe00000 and schigh.bin (32-byte header) at
++    fff00100.
++*/
++
++#include "emu.h"
++
++#include "mpc823_imm.h"
++
++#include "bus/ata/ataintf.h"
++#include "bus/ata/hdd.h"
++#include "bus/rs232/rs232.h"
++#include "imagedev/harddriv.h"
++#include "cpu/powerpc/ppc.h"
++#include "machine/nvram.h"
++
++#include "screen.h"
++
++#include <deque>
++
++#define LOG_ASIC    (1U << 1)
++#define LOG_PCMCIA  (1U << 2)
++#define LOG_SPI     (1U << 3)
++#define LOG_MPU     (1U << 4)
++#define VERBOSE (LOG_ASIC | LOG_PCMCIA | LOG_MPU)
++#include "logmacro.h"
++
++namespace {
++
++class dc260_state : public driver_device
++{
++public:
++	dc260_state(const machine_config &mconfig, device_type type, const char *tag)
++		: driver_device(mconfig, type, tag)
++		, m_maincpu(*this, "maincpu")
++		, m_imm(*this, "imm")
++		, m_ata(*this, "cf")
++		, m_serial(*this, "serial")
++		, m_ram(*this, "ram")
++		, m_nvram(*this, "eeprom")
++		, m_screen(*this, "screen")
++		, m_sw(*this, "SW%u", 0U)
++		, m_dial(*this, "DIAL")
++		, m_power(*this, "POWER")
++	{ }
++
++	void dc260(machine_config &config) ATTR_COLD;
++
++	// the image pipeline (CCD, capture ASIC) and the audio codec are not emulated yet
++	static constexpr feature_type unemulated_features() { return feature::CAMERA | feature::SOUND; }
++
++protected:
++	virtual void machine_start() override ATTR_COLD;
++	virtual void machine_reset() override ATTR_COLD;
++
++private:
++	required_device<mpc823_device> m_maincpu;
++	required_device<mpc823_imm_device> m_imm;
++	required_device<ata_interface_device> m_ata;
++	required_device<rs232_port_device> m_serial;
++	required_shared_ptr<uint32_t> m_ram;
++	required_device<nvram_device> m_nvram;
++	required_device<screen_device> m_screen;
++	required_ioport_array<3> m_sw;
++	required_ioport m_dial;
++	required_ioport m_power;
++	bool m_powered_off = false;   // the MPU has cut the main supply, the Power button restarts
++	uint8_t m_power_last = 0;
++
++	void main_map(address_map &map) ATTR_COLD;
++	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
++
++	uint32_t asic_r(offs_t offset, uint32_t mem_mask);
++	void asic_w(offs_t offset, uint32_t data, uint32_t mem_mask);
++	uint8_t pcmcia_r(offs_t offset);
++	void pcmcia_w(offs_t offset, uint8_t data);
++	bool card_present();
++	harddisk_image_device *m_cf_image = nullptr;
++	uint8_t spi_xfer(offs_t data);
++
++	// 24C16 serial EEPROM (2 KB) on the CPM I2C bus: settings and calibration
++	uint8_t eeprom_i2c(offs_t op);
++	void eeprom_default(nvram_device &nvram, void *base, size_t size);
++	uint8_t m_eeprom[0x800];
++	uint16_t m_eeprom_ptr;
++	uint8_t m_eeprom_phase;
++
++	// camera sub-microcontroller ("MPU") on the SPI: it is the master and clocks every frame
++	void portc_w(offs_t offset, uint16_t data, uint16_t mem_mask);
++	TIMER_CALLBACK_MEMBER(mpu_step);
++	void mpu_camera_frame(const std::vector<uint8_t> &frame);
++	void mpu_queue_reply(uint8_t cmd, uint8_t sn, const std::vector<uint8_t> &payload);
++	std::vector<uint8_t> mpu_switches();
++	TIMER_CALLBACK_MEMBER(mpu_scan);
++	emu_timer *m_mpu_scan_timer;
++	uint8_t m_mpu_sw_sent[3];
++	bool m_mpu_sw_valid = false;   // switches are reported once the camera has read them
++
++	enum { MPU_CLOCK_CAMERA, MPU_RAISE_IRQ2, MPU_DELIVER };
++
++	uint32_t m_asic[0x8000 / 4];
++	uint16_t m_portc;
++	emu_timer *m_mpu_timer;
++	emu_timer *m_mpu_quiet_timer;   // the MPU answers once the camera stops sending
++	std::deque<std::vector<uint8_t>> m_mpu_outbox;
++	bool m_mpu_ack_due;
++	bool m_mpu_irq;
++};
++
++void dc260_state::machine_start()
++{
++	m_maincpu->ppcdrc_set_options(PPCDRC_COMPATIBLE_OPTIONS);
++	m_maincpu->ppcdrc_add_fastram(0x00000000, 0x007fffff, false, m_ram);
++
++	m_cf_image = m_ata->subdevice<harddisk_image_device>("0:cf:image");
++
++	m_mpu_timer = timer_alloc(FUNC(dc260_state::mpu_step), this);
++	m_mpu_scan_timer = timer_alloc(FUNC(dc260_state::mpu_scan), this);
++	m_mpu_quiet_timer = timer_alloc(FUNC(dc260_state::mpu_step), this);
++
++	m_nvram->set_base(m_eeprom, sizeof(m_eeprom));
++
++	save_item(NAME(m_asic));
++	save_item(NAME(m_eeprom));
++	save_item(NAME(m_eeprom_ptr));
++	save_item(NAME(m_eeprom_phase));
++	save_item(NAME(m_portc));
++	save_item(NAME(m_mpu_ack_due));
++	save_item(NAME(m_mpu_irq));
++	save_item(NAME(m_mpu_sw_sent));
++	save_item(NAME(m_mpu_sw_valid));
++	save_item(NAME(m_powered_off));
++	save_item(NAME(m_power_last));
++}
++
++void dc260_state::machine_reset()
++{
++	std::fill(std::begin(m_asic), std::end(m_asic), 0);
++	// PIPR slot B: CD1/CD2 low with a card, RDY high
++	m_imm->set_pcmcia_pins(card_present() ? 0x00000100 : 0x00001800);
++
++	m_portc = 0;
++	m_eeprom_ptr = 0;
++	m_eeprom_phase = 0;
++	m_mpu_outbox.clear();
++	m_mpu_ack_due = false;
++	m_mpu_irq = false;
++	m_mpu_sw_valid = false;
++	m_powered_off = false;
++	m_mpu_scan_timer->adjust(attotime::from_msec(20), 0, attotime::from_msec(20));
++}
++
++void dc260_state::portc_w(offs_t offset, uint16_t data, uint16_t mem_mask)
++{
++	uint16_t const rising = data & ~m_portc;
++	m_portc = data;
++
++	// PC12: the camera wants a frame clocked (a command, an acknowledge, or its receiver is armed)
++	if (rising & 0x0008)
++		m_mpu_timer->adjust(attotime::from_msec(1), MPU_CLOCK_CAMERA);
++
++	// PC8: the camera answers IRQ2 with its receiver armed
++	if ((rising & 0x0080) && m_mpu_irq)
++		m_mpu_timer->adjust(attotime::from_usec(100), MPU_DELIVER);
++}
++
++static std::string mpu_hex(const std::vector<uint8_t> &frame)
++{
++	std::string hex;
++	for (uint8_t b : frame)
++		hex += util::string_format(" %02x", b);
++	return hex;
++}
++
++/*
++    Link protocol, as the camera side (Kodak's mcon task) expects it:
++      camera command  : pulse PC12, the MPU clocks the frame out
++      MPU acknowledge : pulse PC12 again with the receiver armed, the MPU sends 00 00
++      MPU message     : IRQ2, the camera arms its receiver, the MPU clocks the frame in
++      camera ack      : pulse PC12, the MPU clocks out two bytes
++    Frames: type, index of last data byte, command, serial, data..., XOR of all before
++*/
++TIMER_CALLBACK_MEMBER(dc260_state::mpu_step)
++{
++	switch (param)
++	{
++		case MPU_CLOCK_CAMERA:
++		{
++			if (m_mpu_ack_due && m_imm->spi_slave_rx_ready())
++			{
++				LOGMASKED(LOG_MPU, "%9.4f MPU -> camera: 00 00 (ack)\n", machine().time().as_double());
++				m_imm->spi_slave_transfer({ 0x00, 0x00 });
++				m_mpu_ack_due = false;
++				if (!m_mpu_outbox.empty() && !m_mpu_irq)
++					m_mpu_quiet_timer->adjust(attotime::from_msec(30), MPU_RAISE_IRQ2);
++				break;
++			}
++			int const len = m_imm->spi_slave_tx_len();
++			// the camera answers IRQ2 with its receiver armed and a 257-byte dummy transmit
++			if (m_mpu_irq && len == 0x101 && m_imm->spi_slave_rx_ready())
++			{
++				m_mpu_timer->adjust(attotime::zero, MPU_DELIVER);
++				break;
++			}
++			if (len <= 0)
++			{
++				LOGMASKED(LOG_MPU, "%9.4f MPU: attention with nothing armed\n", machine().time().as_double());
++				break;
++			}
++			std::vector<uint8_t> const frame = m_imm->spi_slave_transfer(std::vector<uint8_t>(len, 0x00));
++			if (len == 2)
++			{
++				LOGMASKED(LOG_MPU, "%9.4f camera -> MPU:%s (ack)\n", machine().time().as_double(), mpu_hex(frame));
++				if (!m_mpu_outbox.empty() && !m_mpu_irq)
++					m_mpu_quiet_timer->adjust(attotime::from_msec(30), MPU_RAISE_IRQ2);
++			}
++			else
++				mpu_camera_frame(frame);
++			break;
++		}
++
++		case MPU_RAISE_IRQ2:
++			// never while the camera is in the middle of a command: its receiver is for our ack
++			if (m_mpu_ack_due)
++			{
++				m_mpu_quiet_timer->adjust(attotime::from_msec(5), MPU_RAISE_IRQ2);
++				break;
++			}
++			LOGMASKED(LOG_MPU, "%9.4f MPU: IRQ2\n", machine().time().as_double());
++			m_imm->irq_pin_w(2, 1);
++			m_mpu_irq = true;
++			m_mpu_timer->adjust(attotime::from_msec(10), MPU_DELIVER);
++			break;
++
++		case MPU_DELIVER:
++			if (!m_mpu_irq || m_mpu_outbox.empty())
++				break;
++			if (m_mpu_ack_due || !m_imm->spi_slave_rx_ready())
++			{
++				m_mpu_timer->adjust(attotime::from_msec(1), MPU_DELIVER);
++				break;
++			}
++			m_imm->irq_pin_w(2, 0);
++			m_mpu_irq = false;
++			LOGMASKED(LOG_MPU, "%9.4f MPU -> camera:%s\n", machine().time().as_double(), mpu_hex(m_mpu_outbox.front()));
++			m_imm->spi_slave_transfer(m_mpu_outbox.front());
++			m_mpu_outbox.pop_front();
++			break;
++	}
++}
++
++void dc260_state::mpu_camera_frame(const std::vector<uint8_t> &frame)
++{
++	LOGMASKED(LOG_MPU, "%9.4f camera -> MPU:%s\n", machine().time().as_double(), mpu_hex(frame));
++
++	if (frame.size() < 5 || frame[0] != 0x00)
++		return;
++
++	m_mpu_ack_due = true;
++	uint8_t const cmd = frame[2], sn = frame[3];
++
++	// only these commands have a reply decoder in the camera (decode_reply_data's table)
++	static const uint8_t replied[] = {
++			0x01, 0x02, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x14, 0x15, 0x1e, 0x1f, 0x28, 0x29, 0x2a,
++			0x2b, 0x32, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x46, 0x64, 0x65, 0x6e, 0x78, 0x82, 0x8c };
++	if (std::find(std::begin(replied), std::end(replied), cmd) == std::end(replied))
++		return;
++
++	switch (cmd)
++	{
++		case 0x6e:
++		{
++			// switches and mode dial; the camera bit-reverses each byte, the dial is one-hot in
++			// the low nibble of the second byte (0x08 Capture, 0x04 Review, 0x02 Connect, 0x01 Brag Book info screen)
++			std::vector<uint8_t> const sw = mpu_switches();
++			std::copy(sw.begin(), sw.end(), m_mpu_sw_sent);
++			m_mpu_sw_valid = true;
++			mpu_queue_reply(cmd, sn, { sw[0], sw[1], sw[2], 0x00 });
++			break;
++		}
++
++		case 0x01:
++			// MPU information: two version bytes, then the model (lens commands need model 1)
++			mpu_queue_reply(cmd, sn, { 0x01, 0x00, 0x01, 0x00 });
++			break;
++
++		case 0x65:
++			// 65 ff: the camera has shut down and asks the MPU to cut the supply
++			if (frame[4] == 0xff)
++			{
++				LOGMASKED(LOG_MPU, "%9.4f MPU: power off\n", machine().time().as_double());
++				m_powered_off = true;
++				break;
++			}
++			[[fallthrough]];
++		case 0x64:
++			// power status: first byte flags, second the battery A/D reading (thresholds 139/121/99)
++			mpu_queue_reply(cmd, sn, { 0x00, 0xc0, 0x00, 0x00 });
++			break;
++
++		default:
++			mpu_queue_reply(cmd, sn, { 0x00, 0x00, 0x00, 0x00 });
++			break;
++	}
++}
++
++std::vector<uint8_t> dc260_state::mpu_switches()
++{
++	return { uint8_t(m_sw[0]->read()), uint8_t(m_sw[1]->read() | m_dial->read()), uint8_t(m_sw[2]->read()) };
++}
++
++// the MPU reports switch changes on its own with notification 0x0a
++TIMER_CALLBACK_MEMBER(dc260_state::mpu_scan)
++{
++	// with the supply cut, only the Power button matters: the MPU powers the camera up again
++	uint8_t const power = m_power->read();
++	bool const pressed = power && !m_power_last;
++	m_power_last = power;
++	if (m_powered_off)
++	{
++		if (pressed)
++		{
++			LOGMASKED(LOG_MPU, "%9.4f MPU: power on\n", machine().time().as_double());
++			machine().schedule_soft_reset();
++		}
++		return;
++	}
++
++	// switch changes are reported only once the camera has read them with command 6e
++	std::vector<uint8_t> const now = mpu_switches();
++	if (!m_mpu_sw_valid || std::equal(now.begin(), now.end(), m_mpu_sw_sent))
++		return;
++	std::copy(now.begin(), now.end(), m_mpu_sw_sent);
++
++	std::vector<uint8_t> msg = { 0x03, 0x05, 0x0a, now[0], now[1], now[2] };
++	uint8_t ck = 0;
++	for (uint8_t b : msg)
++		ck ^= b;
++	msg.push_back(ck);
++	LOGMASKED(LOG_MPU, "%9.4f MPU: switches%s\n", machine().time().as_double(), mpu_hex(now));
++	m_mpu_outbox.push_back(msg);
++	if (!m_mpu_irq && !m_mpu_ack_due)
++		m_mpu_quiet_timer->adjust(attotime::from_msec(2), MPU_RAISE_IRQ2);
++}
++
++void dc260_state::mpu_queue_reply(uint8_t cmd, uint8_t sn, const std::vector<uint8_t> &payload)
++{
++	std::vector<uint8_t> msg = { 0x01, 0x00, cmd, sn, 0x00 };
++	msg.insert(msg.end(), payload.begin(), payload.end());
++	msg[1] = msg.size() - 1;
++	uint8_t ck = 0;
++	for (uint8_t b : msg)
++		ck ^= b;
++	msg.push_back(ck);
++
++	m_mpu_outbox.push_back(msg);
++}
++
++uint32_t dc260_state::asic_r(offs_t offset, uint32_t mem_mask)
++{
++	if (!machine().side_effects_disabled())
++		LOGMASKED(LOG_ASIC, "%s: ASIC read %06x & %08x = %08x\n", machine().describe_context(), 0x810000 + offset * 4, mem_mask, m_asic[offset]);
++	return m_asic[offset];
++}
++
++void dc260_state::asic_w(offs_t offset, uint32_t data, uint32_t mem_mask)
++{
++	LOGMASKED(LOG_ASIC, "%s: ASIC write %06x = %08x & %08x\n", machine().describe_context(), 0x810000 + offset * 4, data, mem_mask);
++	COMBINE_DATA(&m_asic[offset]);
++}
++
++/*
++    CompactFlash in slot B.  The firmware programs window 0 as a 16-byte, 8-bit I/O window,
++    the "contiguous I/O" layout of a CF card: 0-7 task file, 8/9 data, D error,
++    E alternate status / device control, F drive address.
++*/
++bool dc260_state::card_present()
++{
++	return m_cf_image && m_cf_image->exists();
++}
++
++uint8_t dc260_state::pcmcia_r(offs_t offset)
++{
++	if (!card_present())
++		return 0xff;
++
++	uint8_t data = 0xff;
++	switch (offset & 0x0f)
++	{
++		case 0x0: case 0x8: case 0x9:
++			data = m_ata->cs0_r(0);
++			break;
++		case 0xd:
++			data = m_ata->cs0_r(1);
++			break;
++		case 0xe:
++			data = m_ata->cs1_r(6);
++			break;
++		case 0xf:
++			data = m_ata->cs1_r(7);
++			break;
++		default:
++			data = m_ata->cs0_r(offset & 7);
++			break;
++	}
++	if (!machine().side_effects_disabled() && (offset & 0x0f) != 0 && (offset & 0x0f) != 8 && (offset & 0x0f) != 9)
++		LOGMASKED(LOG_PCMCIA, "%s: CF read %x = %02x\n", machine().describe_context(), offset, data);
++	return data;
++}
++
++void dc260_state::pcmcia_w(offs_t offset, uint8_t data)
++{
++	if (!card_present())
++		return;
++
++	if ((offset & 0x0f) != 0 && (offset & 0x0f) != 8 && (offset & 0x0f) != 9)
++		LOGMASKED(LOG_PCMCIA, "%s: CF write %x = %02x\n", machine().describe_context(), offset, data);
++	switch (offset & 0x0f)
++	{
++		case 0x0: case 0x8: case 0x9:
++			m_ata->cs0_w(0, data);
++			break;
++		case 0xe:
++			m_ata->cs1_w(6, data);
++			break;
++		case 0xd: case 0xf:
++			break;
++		default:
++			m_ata->cs0_w(offset & 7, data);
++			break;
++	}
++}
++
++/*
++    No factory EEPROM dump exists.  An all-zero PRAM passes the camera's check (a zero
++    'chks' disables it); the one field that must be valid is the region code 'rgnc'
++    (byte 0x56 bit 6, four bits, MSB first): 1 = U.S. English.
++*/
++void dc260_state::eeprom_default(nvram_device &nvram, void *base, size_t size)
++{
++	uint8_t *const p = static_cast<uint8_t *>(base);
++	std::fill_n(p, size, 0);
++	p[0x57] = 0x40;
++}
++
++uint8_t dc260_state::eeprom_i2c(offs_t op)
++{
++	enum { IDLE, WORD_ADDRESS, WRITE, READ };
++	uint8_t const data = op & 0xff;
++
++	switch (op & 0xf00)
++	{
++		case mpc823_imm_device::I2C_START:
++			if ((data & 0xf0) != 0xa0)
++				return 0;
++			m_eeprom_ptr = ((data & 0x0e) << 7) | (m_eeprom_ptr & 0xff);
++			m_eeprom_phase = (data & 1) ? READ : WORD_ADDRESS;
++			return 1;
++
++		case mpc823_imm_device::I2C_WRITE:
++			if (m_eeprom_phase == WORD_ADDRESS)
++			{
++				m_eeprom_ptr = (m_eeprom_ptr & 0x700) | data;
++				m_eeprom_phase = WRITE;
++			}
++			else if (m_eeprom_phase == WRITE)
++			{
++				m_eeprom[m_eeprom_ptr] = data;
++				m_eeprom_ptr = (m_eeprom_ptr & ~0x0f) | ((m_eeprom_ptr + 1) & 0x0f);   // 16-byte pages
++			}
++			return 1;
++
++		case mpc823_imm_device::I2C_READ:
++		{
++			uint8_t const v = m_eeprom[m_eeprom_ptr];
++			m_eeprom_ptr = (m_eeprom_ptr + 1) & 0x7ff;
++			return v;
++		}
++
++		default:
++			m_eeprom_phase = IDLE;
++			return 0;
++	}
++}
++
++uint8_t dc260_state::spi_xfer(offs_t data)
++{
++	LOGMASKED(LOG_SPI, "SPI out %02x\n", data);
++	return 0xff;
++}
++
++uint32_t dc260_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
++{
++	// VCCR bit 0 enables the video controller; 0x814 holds field A's frame buffer
++	uint32_t const base = m_imm->peek32(0x814);
++	if (m_powered_off || !(m_imm->peek32(0x800) >> 16 & 1) || base + 576 * 2 * 216 > 0x800000)
++	{
++		bitmap.fill(rgb_t::black(), cliprect);
++		return 0;
++	}
++
++	for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
++	{
++		uint32_t *dst = &bitmap.pix(y);
++		offs_t src = base + (y >> 1) * 576 * 2;
++		for (int x = 0; x < 576; x += 2, src += 4)
++		{
++			// each 32-bit word holds Cb Y0 Cr Y1
++			uint32_t const w = m_ram[src >> 2];
++			int const cb = int(w >> 24) - 128;
++			int const y0 = (w >> 16) & 0xff;
++			int const cr = int((w >> 8) & 0xff) - 128;
++			int const y1 = w & 0xff;
++			for (int k = 0; k < 2; k++)
++			{
++				int const yy = k ? y1 : y0;
++				int const r = std::clamp(yy + (1436 * cr >> 10), 0, 255);
++				int const g = std::clamp(yy - ((352 * cb + 731 * cr) >> 10), 0, 255);
++				int const b = std::clamp(yy + (1815 * cb >> 10), 0, 255);
++				if (x + k >= cliprect.min_x && x + k <= cliprect.max_x)
++					dst[x + k] = rgb_t(r, g, b);
++			}
++		}
++	}
++	return 0;
++}
++
++void dc260_state::main_map(address_map &map)
++{
++	map(0x00000000, 0x007fffff).ram().share("ram");
++	map(0x00810000, 0x00817fff).rw(FUNC(dc260_state::asic_r), FUNC(dc260_state::asic_w));
++	map(0x02000000, 0x0200000f).mirror(0x01fffff0).rw(FUNC(dc260_state::pcmcia_r), FUNC(dc260_state::pcmcia_w));
++	map(0xff000000, 0xff003fff).rw(m_imm, FUNC(mpc823_imm_device::read), FUNC(mpc823_imm_device::write));
++	map(0xffe00000, 0xffffffff).rom().region("flash", 0);
++}
++
++// switch bytes as the MPU sends them (the camera bit-reverses each byte); the bits without a
++// known function are left unassigned
++static INPUT_PORTS_START( dc260 )
++	PORT_START("SW0")
++	PORT_BIT( 0x01, IP_ACTIVE_HIGH, IPT_JOYSTICK_UP )    PORT_NAME("Up")
++	PORT_BIT( 0x02, IP_ACTIVE_HIGH, IPT_JOYSTICK_DOWN )  PORT_NAME("Down")
++	PORT_BIT( 0x04, IP_ACTIVE_HIGH, IPT_JOYSTICK_LEFT )  PORT_NAME("Left")
++	PORT_BIT( 0x08, IP_ACTIVE_HIGH, IPT_JOYSTICK_RIGHT ) PORT_NAME("Right")
++	// 0.4, 0.5, 1.5, 1.6 and 1.7 are unidentified camera buttons; their keys follow DoomD's use of them
++	PORT_BIT( 0x10, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 0.4") PORT_CODE(KEYCODE_LCONTROL)
++	PORT_BIT( 0x20, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 0.5") PORT_CODE(KEYCODE_SPACE)
++	PORT_BIT( 0x40, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 0.6")
++	PORT_BIT( 0x80, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 0.7")
++
++	PORT_START("SW1")
++	PORT_BIT( 0x10, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 1.4")
++	PORT_BIT( 0x20, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 1.5") PORT_CODE(KEYCODE_MINUS)
++	PORT_BIT( 0x40, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 1.6") PORT_CODE(KEYCODE_EQUALS)
++	PORT_BIT( 0x80, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 1.7") PORT_CODE(KEYCODE_ENTER)
++	PORT_BIT( 0x0f, IP_ACTIVE_HIGH, IPT_UNUSED )
++
++	PORT_START("SW2")
++	PORT_BIT( 0x01, IP_ACTIVE_HIGH, IPT_BUTTON4 ) PORT_NAME("Menu") PORT_CODE(KEYCODE_M)
++	PORT_BIT( 0x02, IP_ACTIVE_HIGH, IPT_BUTTON1 ) PORT_NAME("Soft Key 1 (left)") PORT_CODE(KEYCODE_1)
++	PORT_BIT( 0x04, IP_ACTIVE_HIGH, IPT_BUTTON2 ) PORT_NAME("Soft Key 2 (middle)") PORT_CODE(KEYCODE_2)
++	PORT_BIT( 0x08, IP_ACTIVE_HIGH, IPT_BUTTON3 ) PORT_NAME("Soft Key 3 (right)") PORT_CODE(KEYCODE_3)
++	PORT_BIT( 0x10, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 2.4")
++	PORT_BIT( 0x20, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 2.5")
++	PORT_BIT( 0x40, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 2.6")
++	PORT_BIT( 0x80, IP_ACTIVE_HIGH, IPT_OTHER ) PORT_NAME("Switch 2.7")
++
++	PORT_START("POWER")
++	PORT_BIT( 0x01, IP_ACTIVE_HIGH, IPT_POWER_ON ) PORT_NAME("Power") PORT_CODE(KEYCODE_O)
++
++	PORT_START("DIAL")
++	PORT_CONFNAME( 0x0f, 0x04, "Mode dial" )
++	PORT_CONFSETTING(    0x08, "Capture" )
++	PORT_CONFSETTING(    0x04, "Review" )
++	PORT_CONFSETTING(    0x02, "Connect" )
++	PORT_CONFSETTING(    0x01, "Brag Book (firmware info)" )
++INPUT_PORTS_END
++
++void dc260_state::dc260(machine_config &config)
++{
++	MPC823(config, m_maincpu, 49'152'000);
++	m_maincpu->set_tb_divisor(6000);   // time base at OSCCLK / 4 = 8192 Hz
++	m_maincpu->set_addrmap(AS_PROGRAM, &dc260_state::main_map);
++
++	MPC823_IMM(config, m_imm, 49'152'000);
++	m_imm->set_space(m_maincpu, AS_PROGRAM);
++	m_imm->irq_cb().set_inputline(m_maincpu, PPC_IRQ);
++	m_imm->txd_cb().set(m_serial, FUNC(rs232_port_device::write_txd));
++	m_imm->spi_cb().set(FUNC(dc260_state::spi_xfer));
++	m_imm->portc_out_cb().set(FUNC(dc260_state::portc_w));
++	m_imm->i2c_cb().set(FUNC(dc260_state::eeprom_i2c));
++
++	NVRAM(config, m_nvram, nvram_device::DEFAULT_CUSTOM);
++	m_nvram->set_custom_handler(FUNC(dc260_state::eeprom_default));
++
++	// the LCD is fed by the MPC823 video controller: YCbCr 4:2:2, 576 x 216 per field, both fields alike
++	SCREEN(config, m_screen);
++	m_screen->set_lcd();
++	m_screen->set_refresh_hz(60);
++	m_screen->set_size(576, 432);
++	m_screen->set_visarea_full();
++	m_screen->set_screen_update(FUNC(dc260_state::screen_update));
++
++	ATA_INTERFACE(config, m_ata).options(ata_devices, "cf", nullptr, true);
++
++	RS232_PORT(config, m_serial, default_rs232_devices, nullptr);
++	m_serial->rxd_handler().set(m_imm, FUNC(mpc823_imm_device::rxd_w));
++}
++
++ROM_START( dc260 )
++	ROM_REGION32_BE( 0x200000, "flash", ROMREGION_ERASEFF )
++	ROM_LOAD( "flshrsrc.bin", 0x000000, 0x072258, CRC(11e6b165) SHA1(786dae7adb7de1387ed32b291a2a914a1bb83b1f) )
++	ROM_LOAD( "schigh.bin",   0x1000e0, 0x0e5e98, CRC(6b6f802a) SHA1(b73f6039e1586b7bf8c1d7cfe56e724e76559f77) )
++ROM_END
++
++} // anonymous namespace
++
++//    YEAR  NAME   PARENT  COMPAT  MACHINE  INPUT  CLASS        INIT        COMPANY           FULLNAME                                FLAGS
++COMP( 1998, dc260, 0,      0,      dc260,   dc260, dc260_state, empty_init, "Eastman Kodak",  "Kodak DC260 Zoom (firmware 1.0.2)",   MACHINE_SUPPORTS_SAVE )
+diff --git a/src/mame/kodak/mpc823_imm.cpp b/src/mame/kodak/mpc823_imm.cpp
+new file mode 100644
+index 00000000..fc5b5893
+--- /dev/null
++++ b/src/mame/kodak/mpc823_imm.cpp
+@@ -0,0 +1,909 @@
++// license:BSD-3-Clause
++// copyright-holders:ajfa
++/*
++    MPC823 internal memory map (IMMR block, 16K)
++
++    Everything not modelled below behaves as plain storage, which is what the
++    port, memory controller and clock registers need.  First access to each
++    unmodelled register is logged.
++*/
++
++#include "emu.h"
++#include "mpc823_imm.h"
++
++#include "multibyte.h"
++
++#include <cstdlib>
++#include <ctime>
++
++#define LOG_UNKNOWN (1U << 1)
++#define LOG_SMC     (1U << 2)
++#define LOG_CPM     (1U << 3)
++#define LOG_SPI     (1U << 4)
++#define LOG_IRQ     (1U << 5)
++#define LOG_I2C     (1U << 6)
++#define VERBOSE (LOG_UNKNOWN | LOG_CPM | LOG_SPI | LOG_I2C)
++#include "logmacro.h"
++
++DEFINE_DEVICE_TYPE(MPC823_IMM, mpc823_imm_device, "mpc823_imm", "MPC823 internal memory map")
++
++mpc823_imm_device::mpc823_imm_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
++	: device_t(mconfig, MPC823_IMM, tag, owner, clock)
++	, device_serial_interface(mconfig, *this)
++	, device_nvram_interface(mconfig, *this)
++	, m_irq_cb(*this)
++	, m_txd_cb(*this)
++	, m_spi_cb(*this, 0xff)
++	, m_i2c_cb(*this, 0xff)
++	, m_portc_out_cb(*this)
++	, m_mem(*this, finder_base::DUMMY_TAG, -1)
++	, m_echo(nullptr)
++	, m_rtc_base(0)
++	, m_rtcsc(0)
++{
++}
++
++void mpc823_imm_device::device_start()
++{
++	m_pit_timer = timer_alloc(FUNC(mpc823_imm_device::pit_tick), this);
++	m_smc_timer = timer_alloc(FUNC(mpc823_imm_device::smc_poll), this);
++	m_rtc_timer = timer_alloc(FUNC(mpc823_imm_device::rtc_second), this);
++	m_i2c_timer = timer_alloc(FUNC(mpc823_imm_device::i2c_done), this);
++	for (auto &t : m_cpm_timer)
++		t = timer_alloc(FUNC(mpc823_imm_device::cpm_timer_tick), this);
++
++	if (const char *path = std::getenv("DIGITA_ECHO"))
++		m_echo = std::fopen(path, "ab");
++
++	save_item(NAME(m_ram));
++	save_item(NAME(m_irq_pins));
++	save_item(NAME(m_cpm_edge));
++	save_item(NAME(m_smc_rbptr));
++	save_item(NAME(m_smc_tbptr));
++	save_item(NAME(m_spi_rbptr));
++	save_item(NAME(m_spi_tbptr));
++	save_item(NAME(m_i2c_rbptr));
++	save_item(NAME(m_i2c_tbptr));
++	save_item(NAME(m_smc_tx_busy));
++	save_item(NAME(m_irq_state));
++	save_item(NAME(m_rtc_base));
++	save_item(NAME(m_rtcsc));
++}
++
++void mpc823_imm_device::device_reset()
++{
++	std::fill(std::begin(m_ram), std::end(m_ram), 0);
++	w16(RTCSC, m_rtcsc);
++	std::fill(std::begin(m_logged), std::end(m_logged), 0);
++	m_irq_pins = 0;
++	m_cpm_edge = 0;
++	m_smc_rbptr = m_smc_tbptr = 0;
++	m_spi_rbptr = m_spi_tbptr = 0;
++	m_i2c_rbptr = m_i2c_tbptr = 0;
++	m_smc_tx_busy = false;
++	m_irq_state = false;
++	m_irq_cb(0);
++	m_txd_cb(1);
++	m_pit_timer->adjust(attotime::never);
++	for (auto &t : m_cpm_timer)
++		t->adjust(attotime::never);
++	m_smc_timer->adjust(attotime::from_usec(100), 0, attotime::from_usec(100));
++	m_rtc_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
++
++	set_data_frame(1, 8, PARITY_NONE, STOP_BITS_1);
++	set_rate(9600);
++	receive_register_reset();
++	transmit_register_reset();
++}
++
++// the RTC and RTCSC live on the keep-alive supply: they survive resets, and the nvram file
++// stores them with the host time of the save, so the clock keeps counting while MAME is closed.
++// A new camera starts with the host's local time and the RTC enabled, so it is taken as set.
++void mpc823_imm_device::nvram_default()
++{
++	std::time_t const now = std::time(nullptr);
++	std::tm utc = *std::gmtime(&now);
++	utc.tm_isdst = -1;
++	int64_t const local = int64_t(now) + (int64_t(now) - int64_t(std::mktime(&utc)));
++	m_rtc_base = uint32_t(local) - uint32_t(machine().time().seconds());
++	m_rtcsc = 0x0001;
++}
++
++bool mpc823_imm_device::nvram_read(util::read_stream &file)
++{
++	uint8_t buf[14];
++	auto const [err, actual] = util::read(file, buf, sizeof(buf));
++	if (err || actual != sizeof(buf))
++		return false;
++	uint32_t const rtc = get_u32be(buf);
++	int64_t const saved = int64_t(get_u64be(buf + 4));
++	int64_t const now = int64_t(std::time(nullptr));
++	m_rtc_base = rtc + uint32_t(now > saved ? now - saved : 0) - uint32_t(machine().time().seconds());
++	m_rtcsc = get_u16be(buf + 12);
++	return true;
++}
++
++bool mpc823_imm_device::nvram_write(util::write_stream &file)
++{
++	uint8_t buf[14];
++	put_u32be(buf, uint32_t(machine().time().seconds()) + m_rtc_base);
++	put_u64be(buf + 4, uint64_t(int64_t(std::time(nullptr))));
++	put_u16be(buf + 12, m_rtcsc);
++	auto const [err, actual] = util::write(file, buf, sizeof(buf));
++	return !err;
++}
++
++// periodic/interrupt timer clock: OSCCLK / 4 or / 512
++uint32_t mpc823_imm_device::pitrtclk() const
++{
++	return 32768 / ((r32(SCCR) & 0x01000000) ? 512 : 4);
++}
++
++/***************************************************************************
++    interrupts
++***************************************************************************/
++
++uint32_t mpc823_imm_device::cpm_pending() const
++{
++	uint32_t pending = m_cpm_edge;
++	static const int timer_vec[4] = { 0x19, 0x12, 0x0c, 0x07 };
++	for (int n = 0; n < 4; n++)
++		if ((r16(cpm_timer_reg(n, 0)) & 0x0010) && (r16(TER1 + 2 * n) & 0x0002))
++			pending |= 1U << timer_vec[n];
++	return pending;
++}
++
++uint32_t mpc823_imm_device::siu_pending()
++{
++	uint32_t pend = r32(SIPEND) & r32(SIEL) & 0xaaaaaaaa;   // edge-latched IRQ pins
++	pend |= m_irq_pins & ~r32(SIEL) & 0xaaaaaaaa;          // level-sensitive IRQ pins
++
++	// internal interrupt levels: level n sets SIPEND bit LVLn = 0x40000000 >> 2n
++	auto level = [] (uint16_t lvlmask) -> uint32_t
++	{
++		uint32_t bits = 0;
++		for (int n = 0; n < 8; n++)
++			if (lvlmask & (0x8000 >> n))
++				bits |= 0x40000000 >> (2 * n);
++		return bits;
++	};
++	uint16_t const piscr = r16(PISCR);
++	if ((piscr & 0x0084) == 0x0084)
++		pend |= level(piscr & 0xff00);
++
++	uint16_t const rtcsc = r16(RTCSC);
++	if (((rtcsc & 0x0088) == 0x0088) || ((rtcsc & 0x0044) == 0x0044))
++		pend |= level(rtcsc & 0xff00);
++
++	uint16_t const tbscr = r16(TBSCR);
++	if (((tbscr & 0x0088) == 0x0088) || ((tbscr & 0x0044) == 0x0044))
++		pend |= level(tbscr & 0xff00);
++
++	// CPM interrupt controller
++	uint32_t const cicr = r32(CICR);
++	if ((cicr & 0x00000080) && (cpm_pending() & r32(CIMR) & ~r32(CISR)))
++		pend |= 0x40000000 >> (2 * ((cicr >> 13) & 7));
++
++	return pend;
++}
++
++void mpc823_imm_device::update_irq()
++{
++	bool const state = (siu_pending() & r32(SIMASK)) != 0;
++	if (state != m_irq_state)
++	{
++		m_irq_state = state;
++		m_irq_cb(state ? ASSERT_LINE : CLEAR_LINE);
++	}
++}
++
++void mpc823_imm_device::irq_pin_w(int line, int state)
++{
++	uint32_t const bit = 0x80000000 >> (2 * line);
++	if (state && !(m_irq_pins & bit) && (r32(SIEL) & bit))
++		w32(SIPEND, r32(SIPEND) | bit);
++	if (state)
++		m_irq_pins |= bit;
++	else
++		m_irq_pins &= ~bit;
++	update_irq();
++}
++
++void mpc823_imm_device::portc_pin_w(int bit, int state)
++{
++	// port C interrupt pins PC15..PC4 map to CPM vectors
++	static const int vec[16] = { -1, -1, -1, -1, 0x01, 0x02, 0x06, 0x09, 0x0a, 0x0b, 0x0e, 0x0f, 0x17, 0x18, 0x1a, 0x1f };
++	uint16_t const mask = 1 << (15 - bit);
++	uint16_t const old = r16(PCDAT);
++	uint16_t const now = state ? (old | mask) : (old & ~mask);
++	w16(PCDAT, now);
++	if (vec[bit] >= 0 && old != now && (!state || !(r16(PCINT) & mask)))
++		m_cpm_edge |= 1U << vec[bit];
++	update_irq();
++}
++
++/***************************************************************************
++    timers
++***************************************************************************/
++
++void mpc823_imm_device::pit_reload()
++{
++	if (r16(PISCR) & 0x0001)
++	{
++		uint32_t const count = (r32(PITC) >> 16) + 1;
++		m_pit_timer->adjust(attotime::from_hz(pitrtclk()) * count);
++	}
++	else
++		m_pit_timer->adjust(attotime::never);
++}
++
++TIMER_CALLBACK_MEMBER(mpc823_imm_device::rtc_second)
++{
++	if (r16(RTCSC) & 0x0001)
++	{
++		w16(RTCSC, r16(RTCSC) | 0x0080);
++		update_irq();
++	}
++}
++
++TIMER_CALLBACK_MEMBER(mpc823_imm_device::pit_tick)
++{
++	w16(PISCR, r16(PISCR) | 0x0080);
++	pit_reload();
++	update_irq();
++}
++
++void mpc823_imm_device::smc_event(uint8_t ev)
++{
++	w8(SMCE1, r8(SMCE1) | ev);
++	if (ev & r8(SMCM1))
++		m_cpm_edge |= 1U << CPM_VEC_SMC1;
++	update_irq();
++}
++
++void mpc823_imm_device::spi_event(uint8_t ev)
++{
++	w8(SPIE, r8(SPIE) | ev);
++	if (ev & r8(SPIM))
++		m_cpm_edge |= 1U << CPM_VEC_SPI;
++	update_irq();
++}
++
++void mpc823_imm_device::i2c_event(uint8_t ev)
++{
++	w8(I2CER, r8(I2CER) | ev);
++	if (ev & r8(I2CMR))
++		m_cpm_edge |= 1U << CPM_VEC_I2C;
++	update_irq();
++}
++
++/***************************************************************************
++    I2C master: walks the transmit descriptors, a descriptor with the S bit
++    (or the first one) begins with an address byte; reads fill the next
++    receive descriptor
++***************************************************************************/
++
++TIMER_CALLBACK_MEMBER(mpc823_imm_device::i2c_done)
++{
++	i2c_transfer();
++}
++
++void mpc823_imm_device::i2c_transfer()
++{
++	bool started = false;
++	uint8_t ev = 0;
++
++	for (int guard = 0; guard < 16; guard++)
++	{
++		offs_t const tbd = 0x2000 + (m_i2c_tbptr & 0x1fff);
++		uint16_t const tstat = r16(tbd);
++		if (!(tstat & 0x8000))
++			break;
++
++		uint16_t const len = r16(tbd + 2);
++		uint32_t const buf = r32(tbd + 4);
++		bool nak = false;
++
++		if (len)
++		{
++			uint8_t const addr = m_mem->read_byte(buf);
++			if (!started || (tstat & 0x0400))
++			{
++				started = true;
++				nak = !m_i2c_cb(I2C_START | addr);
++				LOGMASKED(LOG_I2C, "I2C start %02x len %d BD %04x status %04x rx BD %04x status %04x%s\n", addr, len,
++						m_i2c_tbptr, tstat, m_i2c_rbptr, r16(0x2000 + (m_i2c_rbptr & 0x1fff)), nak ? " NAK" : "");
++				if (!nak && (addr & 1))
++				{
++					// read: the remaining length is the number of bytes to receive
++					offs_t const rbd = 0x2000 + (m_i2c_rbptr & 0x1fff);
++					uint16_t const rstat = r16(rbd);
++					uint16_t const n = len - 1;
++					if (rstat & 0x8000)
++					{
++						for (uint16_t i = 0; i < n; i++)
++							m_mem->write_byte(r32(rbd + 4) + i, m_i2c_cb(I2C_READ));
++						w16(rbd + 2, n);
++						w16(rbd, (rstat & ~0x8000) | 0x0800);
++						m_i2c_rbptr = (rstat & 0x2000) ? r16(I2C_PRAM + 0) : m_i2c_rbptr + 8;
++						w16(I2C_PRAM + 0x10, m_i2c_rbptr);
++						if (rstat & 0x1000)
++							ev |= 0x01;
++					}
++				}
++				else
++				{
++					for (uint16_t i = 1; i < len && !nak; i++)
++						nak = !m_i2c_cb(I2C_WRITE | m_mem->read_byte(buf + i));
++				}
++			}
++			else
++			{
++				for (uint16_t i = 0; i < len && !nak; i++)
++					nak = !m_i2c_cb(I2C_WRITE | m_mem->read_byte(buf + i));
++			}
++		}
++
++		w16(tbd, (tstat & ~0x8000) | (nak ? 0x0004 : 0));
++		m_i2c_tbptr = (tstat & 0x2000) ? r16(I2C_PRAM + 2) : m_i2c_tbptr + 8;
++		w16(I2C_PRAM + 0x20, m_i2c_tbptr);
++		if (nak)
++			ev |= 0x10;
++		else if (tstat & 0x1000)
++			ev |= 0x02;
++		if (nak || (tstat & 0x0800))
++			break;
++	}
++	m_i2c_cb(I2C_STOP);
++	LOGMASKED(LOG_I2C, "I2C transfer done, events %02x (I2CMR %02x CIMR %08x)\n", ev, r8(I2CMR), r32(CIMR));
++	if (ev)
++		i2c_event(ev);
++}
++
++/***************************************************************************
++    CPM general-purpose timers
++***************************************************************************/
++
++// reg: 0 TMR, 1 TRR, 2 TCR, 3 TCN
++offs_t mpc823_imm_device::cpm_timer_reg(int n, int reg) const
++{
++	return TMR1 + ((n & 2) ? 0x10 : 0) + reg * 4 + (n & 1) * 2;
++}
++
++void mpc823_imm_device::cpm_timer_reload(int n)
++{
++	uint16_t const tgcr = r16(TGCR) >> (4 * n);
++	uint16_t const tmr = r16(cpm_timer_reg(n, 0));
++	int const iclk = (tmr >> 1) & 3;
++	if (!(tgcr & 0x1) || (tgcr & 0x2) || iclk == 0 || iclk == 3)
++	{
++		m_cpm_timer[n]->adjust(attotime::never);
++		return;
++	}
++	uint32_t const prescale = ((tmr >> 8) & 0xff) + 1;
++	uint32_t const div = (iclk == 2) ? 16 : 1;
++	uint32_t const ref = r16(cpm_timer_reg(n, 1)) ? r16(cpm_timer_reg(n, 1)) : 0x10000;
++	attotime const period = attotime::from_hz(clock()) * (prescale * div * ref);
++	m_cpm_timer[n]->adjust(period, n, period);
++}
++
++TIMER_CALLBACK_MEMBER(mpc823_imm_device::cpm_timer_tick)
++{
++	w16(TER1 + 2 * param, r16(TER1 + 2 * param) | 0x0002);
++	update_irq();
++}
++
++/***************************************************************************
++    SMC1 in UART mode
++***************************************************************************/
++
++void mpc823_imm_device::smc_update_rate()
++{
++	uint32_t const brgc = r32(BRGC1);
++	if (!(brgc & 0x00010000))
++		return;
++	uint32_t const cd = ((brgc >> 1) & 0xfff) + 1;
++	uint32_t const div = (brgc & 1) ? 16 : 1;
++	uint32_t const baud = clock() / (cd * div * 16);
++	LOGMASKED(LOG_SMC, "SMC1 %d baud\n", baud);
++	set_rate(baud);
++}
++
++TIMER_CALLBACK_MEMBER(mpc823_imm_device::smc_poll)
++{
++	smc_try_transmit();
++}
++
++void mpc823_imm_device::smc_try_transmit()
++{
++	if (m_smc_tx_busy || !(r16(SMCMR1) & 0x0002))
++		return;
++
++	offs_t const bd = 0x2000 + (m_smc_tbptr & 0x1fff);
++	uint16_t const status = r16(bd);
++	if (!(status & 0x8000))
++		return;
++
++	uint16_t const len = r16(bd + 2);
++	uint32_t const buf = r32(bd + 4);
++	for (uint16_t i = 0; i < len; i++)
++	{
++		uint8_t const ch = m_mem->read_byte(buf + i);
++		if (m_echo)
++		{
++			std::fputc(ch, m_echo);
++			std::fflush(m_echo);
++		}
++	}
++
++	// the characters leave through the serial line at the programmed rate
++	if (len)
++	{
++		m_smc_tx_busy = true;
++		transmit_register_setup(m_mem->read_byte(buf));
++		w16(SMC1_PRAM + 0x3c, 1);   // index of next byte (internal)
++		w16(SMC1_PRAM + 0x3e, len);
++		return;
++	}
++
++	w16(bd, status & ~0x8000);
++	m_smc_tbptr = (status & 0x2000) ? r16(SMC1_PRAM + 2) : m_smc_tbptr + 8;
++	w16(SMC1_PRAM + 0x20, m_smc_tbptr);
++	if (status & 0x1000)
++		smc_event(0x02);
++	update_irq();
++}
++
++void mpc823_imm_device::tra_callback()
++{
++	m_txd_cb(transmit_register_get_data_bit());
++}
++
++void mpc823_imm_device::tra_complete()
++{
++	if (!m_smc_tx_busy)
++		return;
++
++	offs_t const bd = 0x2000 + (m_smc_tbptr & 0x1fff);
++	uint16_t const status = r16(bd);
++	uint16_t const index = r16(SMC1_PRAM + 0x3c);
++	uint16_t const len = r16(SMC1_PRAM + 0x3e);
++	if (index < len)
++	{
++		transmit_register_setup(m_mem->read_byte(r32(bd + 4) + index));
++		w16(SMC1_PRAM + 0x3c, index + 1);
++		return;
++	}
++
++	m_smc_tx_busy = false;
++	w16(bd, status & ~0x8000);
++	m_smc_tbptr = (status & 0x2000) ? r16(SMC1_PRAM + 2) : m_smc_tbptr + 8;
++	w16(SMC1_PRAM + 0x20, m_smc_tbptr);
++	if (status & 0x1000)
++		smc_event(0x02);
++	update_irq();
++	smc_try_transmit();
++}
++
++void mpc823_imm_device::rcv_complete()
++{
++	receive_register_extract();
++	uint8_t const ch = get_received_char();
++	if (!(r16(SMCMR1) & 0x0001))
++		return;
++
++	offs_t const bd = 0x2000 + (m_smc_rbptr & 0x1fff);
++	uint16_t const status = r16(bd);
++	if (!(status & 0x8000))
++	{
++		smc_event(0x10);   // busy: character lost
++		update_irq();
++		return;
++	}
++	m_mem->write_byte(r32(bd + 4), ch);
++	w16(bd + 2, 1);
++	w16(bd, status & ~0x8000);
++	m_smc_rbptr = (status & 0x2000) ? r16(SMC1_PRAM + 0) : m_smc_rbptr + 8;
++	w16(SMC1_PRAM + 0x10, m_smc_rbptr);
++	if (status & 0x1000)
++		smc_event(0x01);
++	update_irq();
++}
++
++/***************************************************************************
++    SPI master
++***************************************************************************/
++
++void mpc823_imm_device::spi_transfer()
++{
++	if (!(r16(SPMODE) & 0x0100))
++		return;
++
++	for (int guard = 0; guard < 64; guard++)
++	{
++		offs_t const tbd = 0x2000 + (m_spi_tbptr & 0x1fff);
++		uint16_t const tstat = r16(tbd);
++		if (!(tstat & 0x8000))
++			break;
++
++		offs_t const rbd = 0x2000 + (m_spi_rbptr & 0x1fff);
++		uint16_t const rstat = r16(rbd);
++		uint16_t const len = r16(tbd + 2);
++		uint32_t const tbuf = r32(tbd + 4);
++		uint32_t const rbuf = r32(rbd + 4);
++		bool const rx_ok = rstat & 0x8000;
++
++		for (uint16_t i = 0; i < len; i++)
++		{
++			uint8_t const out = m_mem->read_byte(tbuf + i);
++			uint8_t const in = m_spi_cb(out);
++			LOGMASKED(LOG_SPI, "SPI %02x -> %02x\n", out, in);
++			if (rx_ok)
++				m_mem->write_byte(rbuf + i, in);
++		}
++
++		w16(tbd, tstat & ~0x8000);
++		m_spi_tbptr = (tstat & 0x2000) ? r16(SPI_PRAM + 2) : m_spi_tbptr + 8;
++		w16(SPI_PRAM + 0x20, m_spi_tbptr);
++		uint8_t ev = 0x02;
++		if (rx_ok)
++		{
++			w16(rbd + 2, len);
++			w16(rbd, (rstat & ~0x8000) | 0x0800);
++			m_spi_rbptr = (rstat & 0x2000) ? r16(SPI_PRAM + 0) : m_spi_rbptr + 8;
++			w16(SPI_PRAM + 0x10, m_spi_rbptr);
++			ev |= 0x01;
++		}
++		spi_event(ev);
++		if (tstat & 0x0800)
++			break;
++	}
++	update_irq();
++}
++
++int mpc823_imm_device::spi_slave_tx_len() const
++{
++	offs_t const tbd = 0x2000 + (m_spi_tbptr & 0x1fff);
++	return (r16(SPMODE) & 0x0100) && (r16(tbd) & 0x8000) ? r16(tbd + 2) : -1;
++}
++
++bool mpc823_imm_device::spi_slave_rx_ready() const
++{
++	offs_t const rbd = 0x2000 + (m_spi_rbptr & 0x1fff);
++	return (r16(SPMODE) & 0x0100) && (r16(rbd) & 0x8000);
++}
++
++// the other end is the master: exchange a whole frame against the armed buffer descriptors
++std::vector<uint8_t> mpc823_imm_device::spi_slave_transfer(const std::vector<uint8_t> &mosi)
++{
++	std::vector<uint8_t> miso(mosi.size(), 0xff);
++	if (!(r16(SPMODE) & 0x0100))
++		return miso;
++
++	offs_t const tbd = 0x2000 + (m_spi_tbptr & 0x1fff);
++	offs_t const rbd = 0x2000 + (m_spi_rbptr & 0x1fff);
++	uint16_t const tstat = r16(tbd);
++	uint16_t const rstat = r16(rbd);
++	uint8_t ev = 0;
++
++	if (tstat & 0x8000)
++	{
++		uint16_t const len = r16(tbd + 2);
++		for (size_t i = 0; i < mosi.size() && i < len; i++)
++			miso[i] = m_mem->read_byte(r32(tbd + 4) + i);
++		w16(tbd, tstat & ~0x8000);
++		m_spi_tbptr = (tstat & 0x2000) ? r16(SPI_PRAM + 2) : m_spi_tbptr + 8;
++		w16(SPI_PRAM + 0x20, m_spi_tbptr);
++		if (tstat & 0x1000)
++			ev |= 0x02;
++	}
++	if (rstat & 0x8000)
++	{
++		uint16_t const mrblr = r16(SPI_PRAM + 6);
++		size_t const n = std::min<size_t>(mosi.size(), mrblr ? mrblr : 0x10000);
++		for (size_t i = 0; i < n; i++)
++			m_mem->write_byte(r32(rbd + 4) + i, mosi[i]);
++		w16(rbd + 2, n);
++		w16(rbd, (rstat & ~0x8000) | 0x0800);
++		m_spi_rbptr = (rstat & 0x2000) ? r16(SPI_PRAM + 0) : m_spi_rbptr + 8;
++		w16(SPI_PRAM + 0x10, m_spi_rbptr);
++		if (rstat & 0x1000)
++			ev |= 0x01;
++	}
++	LOGMASKED(LOG_SPI, "SPI slave frame of %d bytes, events %02x\n", int(mosi.size()), ev);
++	spi_event(ev);
++	update_irq();
++	return miso;
++}
++
++/***************************************************************************
++    communication processor commands
++***************************************************************************/
++
++void mpc823_imm_device::cpm_command(uint16_t cmd)
++{
++	int const op = (cmd >> 8) & 0xf;
++	int const ch = (cmd >> 4) & 0xf;
++	LOGMASKED(LOG_CPM, "CPM command %x channel %x\n", op, ch);
++
++	if (cmd & 0x8000)
++		return;
++
++	if (ch == 0x9)   // SMC1
++	{
++		if (op == 0 || op == 1)
++		{
++			m_smc_rbptr = r16(SMC1_PRAM + 0);
++			w16(SMC1_PRAM + 0x10, m_smc_rbptr);
++		}
++		if (op == 0 || op == 2)
++		{
++			m_smc_tbptr = r16(SMC1_PRAM + 2);
++			w16(SMC1_PRAM + 0x20, m_smc_tbptr);
++		}
++	}
++	else if (ch == 0x1)   // I2C
++	{
++		if (op == 0 || op == 1)
++		{
++			m_i2c_rbptr = r16(I2C_PRAM + 0);
++			w16(I2C_PRAM + 0x10, m_i2c_rbptr);
++		}
++		if (op == 0 || op == 2)
++		{
++			m_i2c_tbptr = r16(I2C_PRAM + 2);
++			w16(I2C_PRAM + 0x20, m_i2c_tbptr);
++		}
++	}
++	else if (ch == 0x5)   // SPI
++	{
++		if (op == 0 || op == 1)
++		{
++			m_spi_rbptr = r16(SPI_PRAM + 0);
++			w16(SPI_PRAM + 0x10, m_spi_rbptr);
++		}
++		if (op == 0 || op == 2)
++		{
++			m_spi_tbptr = r16(SPI_PRAM + 2);
++			w16(SPI_PRAM + 0x20, m_spi_tbptr);
++		}
++	}
++}
++
++/***************************************************************************
++    bus interface
++***************************************************************************/
++
++uint32_t mpc823_imm_device::read(offs_t offset, uint32_t mem_mask)
++{
++	offs_t const byteoff = offset << 2;
++
++	switch (byteoff)
++	{
++		case SIPEND:
++			return siu_pending();
++
++		case SIVEC:
++		{
++			uint32_t const pend = siu_pending() & r32(SIMASK);
++			int const n = pend ? __builtin_clz(pend) : 0x3c >> 2;
++			if (!machine().side_effects_disabled())
++				LOGMASKED(LOG_IRQ, "%s: SIVEC %d (pending %08x mask %08x)\n", machine().describe_context(), n, siu_pending(), r32(SIMASK));
++			return uint32_t(n) << 26 | uint32_t(n) << 10 | 0;
++		}
++
++		case RTC:
++			return uint32_t(machine().time().seconds()) + m_rtc_base;
++
++		case 0x0f0:   // PIPR
++			return m_pipr;
++
++		case PITR & ~3:
++			if (m_pit_timer->enabled())
++				return uint32_t(m_pit_timer->remaining().as_double() * pitrtclk()) << 16;
++			return 0;
++
++		case CIVR & ~3:
++		{
++			uint32_t const pend = cpm_pending() & r32(CIMR) & ~r32(CISR);
++			int const vec = pend ? 31 - __builtin_clz(pend) : 0;
++			// the acknowledged vector goes in service and stops requesting until CISR is written
++			if (pend && !machine().side_effects_disabled())
++			{
++				w32(CISR, r32(CISR) | (1U << vec));
++				update_irq();
++			}
++			if (!machine().side_effects_disabled())
++				LOGMASKED(LOG_IRQ, "%s: CIVR vector %02x (pending %08x CIMR %08x CISR %08x)\n", machine().describe_context(), vec, cpm_pending(), r32(CIMR), r32(CISR));
++			return (uint32_t(vec) << 27) | (r32(CIVR & ~3) & 0x0000ffff);
++		}
++	}
++
++	if (byteoff >= 0x2000 || !machine().side_effects_disabled())
++	{
++		if (byteoff < 0x2000 && !BIT(m_logged[offset >> 3], offset & 7) && byteoff >= 0x800 && byteoff != CPCR && byteoff != (SMCMR1 & ~3) && byteoff != (SMCE1 & ~3))
++		{
++			m_logged[offset >> 3] |= 1 << (offset & 7);
++			LOGMASKED(LOG_UNKNOWN, "%s: read %03x & %08x\n", machine().describe_context(), byteoff, mem_mask);
++		}
++	}
++	return r32(byteoff);
++}
++
++void mpc823_imm_device::write(offs_t offset, uint32_t data, uint32_t mem_mask)
++{
++	offs_t const byteoff = offset << 2;
++	uint32_t const old = r32(byteoff);
++	uint32_t val = (old & ~mem_mask) | (data & mem_mask);
++
++	switch (byteoff)
++	{
++		case SIPEND:
++			// writing ones clears edge-latched IRQ pins
++			w32(SIPEND, old & ~(data & mem_mask & 0xaaaaaaaa));
++			update_irq();
++			return;
++
++		case CIPR:
++			m_cpm_edge &= ~(data & mem_mask);
++			update_irq();
++			return;
++
++		case CISR:
++			// SPI and SMC1 requests latch on a new unmasked event and are released here:
++			// Kodak's SPI handler only acknowledges CISR and never clears SPIE
++			w32(CISR, old & ~(data & mem_mask));
++			m_cpm_edge &= ~(data & mem_mask & ((1U << CPM_VEC_SMC1) | (1U << CPM_VEC_SPI) | (1U << CPM_VEC_I2C)));
++			update_irq();
++			return;
++	}
++
++	w32(byteoff, val);
++	reg_written(byteoff, old, data, mem_mask);
++}
++
++void mpc823_imm_device::reg_written(offs_t byteoff, uint32_t old, uint32_t data, uint32_t mem_mask)
++{
++	switch (byteoff)
++	{
++		case SIMASK:
++		case SIEL:
++		case CICR:
++		case CIMR:
++			update_irq();
++			break;
++
++		case PISCR & ~3:
++			if (ACCESSING_BITS_16_31)
++			{
++				// PS is write-one-to-clear
++				uint16_t const oldv = old >> 16, newv = data >> 16;
++				w16(PISCR, (newv & ~0x0080) | (oldv & 0x0080 & ~newv));
++				if ((oldv ^ newv) & 0x0001)
++					pit_reload();
++				update_irq();
++			}
++			break;
++
++		case PITC:
++			pit_reload();
++			break;
++
++		case TBSCR & ~3:
++			if (ACCESSING_BITS_16_31)
++			{
++				uint16_t const oldv = old >> 16, newv = data >> 16;
++				w16(TBSCR, (newv & ~0x00c0) | (oldv & 0x00c0 & ~newv));
++				update_irq();
++			}
++			break;
++
++		case RTCSC & ~3:
++			if (ACCESSING_BITS_16_31)
++			{
++				uint16_t const oldv = old >> 16, newv = data >> 16;
++				w16(RTCSC, (newv & ~0x00c0) | (oldv & 0x00c0 & ~newv));
++				m_rtcsc = newv & ~0x00c0;
++				update_irq();
++			}
++			break;
++
++		case RTC:
++			m_rtc_base = r32(RTC) - uint32_t(machine().time().seconds());
++			break;
++
++		case CIVR & ~3:
++			break;
++
++		case CPCR & ~3:
++			if (ACCESSING_BITS_16_31)
++			{
++				uint16_t const cmd = r16(CPCR);
++				if (cmd & 0x0001)
++				{
++					cpm_command(cmd);
++					w16(CPCR, cmd & ~0x8001);
++				}
++			}
++			break;
++
++		case BRGC1:
++			smc_update_rate();
++			break;
++
++		case PCDAT & ~3:
++			if (ACCESSING_BITS_0_15 && ((old ^ data) & mem_mask & 0xffff))
++				m_portc_out_cb(0, r16(PCDAT), 0xffff);
++			break;
++
++		case TGCR:
++		case 0x990: case 0x994: case 0x9a0: case 0x9a4:
++			for (int n = 0; n < 4; n++)
++				cpm_timer_reload(n);
++			break;
++
++		case 0x9b0: case 0x9b4:
++			// TER: write one to clear
++			w32(byteoff, old & ~(data & mem_mask));
++			update_irq();
++			break;
++
++		case SMCMR1 & ~3:
++		case SMCE1 & ~3:
++		case SMCM1 & ~3:
++			if (byteoff == (SMCE1 & ~3) && ACCESSING_BITS_16_23)
++				w8(SMCE1, (old >> 16) & ~(data >> 16) & 0xff);
++			smc_try_transmit();
++			update_irq();
++			break;
++
++		case SPIE & ~3:
++			if (ACCESSING_BITS_8_15)
++				w8(SPIE, (old >> 8) & ~(data >> 8) & 0xff);
++			update_irq();
++			break;
++
++		case I2COM:
++			if (ACCESSING_BITS_24_31 && (r8(I2COM) & 0x80))
++			{
++				// the bus takes time: the firmware drains its completion semaphore right after starting
++				w8(I2COM, r8(I2COM) & 0x7f);
++				if ((r8(I2COM) & 0x01) && (r8(I2MOD) & 0x01))
++					m_i2c_timer->adjust(attotime::from_usec(300));
++			}
++			break;
++
++		case I2CER:
++			// write one to clear
++			if (ACCESSING_BITS_24_31)
++				w8(I2CER, (old >> 24) & ~(data >> 24) & 0xff);
++			update_irq();
++			break;
++
++		case I2CMR:
++			update_irq();
++			break;
++
++		case SPIM & ~3:
++			update_irq();
++			break;
++
++		case SPCOM & ~3:
++			if (ACCESSING_BITS_16_23 && (r8(SPCOM) & 0x80))
++			{
++				// as a slave the transfer waits for the master's clock
++				w8(SPCOM, 0);
++				if (r16(SPMODE) & 0x0200)
++					spi_transfer();
++			}
++			break;
++
++		default:
++			if (byteoff >= 0x800 && byteoff < 0x2000 && !BIT(m_logged[(byteoff >> 2) >> 3], (byteoff >> 2) & 7))
++			{
++				m_logged[(byteoff >> 2) >> 3] |= 1 << ((byteoff >> 2) & 7);
++				LOGMASKED(LOG_UNKNOWN, "%s: write %03x = %08x & %08x\n", machine().describe_context(), byteoff, data, mem_mask);
++			}
++			break;
++	}
++}
+diff --git a/src/mame/kodak/mpc823_imm.h b/src/mame/kodak/mpc823_imm.h
+new file mode 100644
+index 00000000..7ac61484
+--- /dev/null
++++ b/src/mame/kodak/mpc823_imm.h
+@@ -0,0 +1,136 @@
++// license:BSD-3-Clause
++// copyright-holders:ajfa
++#ifndef MAME_KODAK_MPC823_IMM_H
++#define MAME_KODAK_MPC823_IMM_H
++
++#pragma once
++
++#include "diserial.h"
++
++// MPC823 internal memory map: SIU, system timers, CPM interrupt controller,
++// communication processor commands and SMC1 in UART mode
++class mpc823_imm_device : public device_t, public device_serial_interface, public device_nvram_interface
++{
++public:
++	mpc823_imm_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
++
++	auto irq_cb() { return m_irq_cb.bind(); }
++	auto txd_cb() { return m_txd_cb.bind(); }
++	auto spi_cb() { return m_spi_cb.bind(); }
++	auto portc_out_cb() { return m_portc_out_cb.bind(); }
++
++	// I2C bus, byte level: offset 0x100|addr = start (returns ack), 0x200|data = write (returns ack),
++	// 0x300 = read a byte, 0x400 = stop
++	enum : offs_t { I2C_START = 0x100, I2C_WRITE = 0x200, I2C_READ = 0x300, I2C_STOP = 0x400 };
++	auto i2c_cb() { return m_i2c_cb.bind(); }
++	template <typename T> void set_space(T &&tag, int spacenum) { m_mem.set_tag(std::forward<T>(tag), spacenum); }
++
++	uint32_t read(offs_t offset, uint32_t mem_mask = ~0);
++	void write(offs_t offset, uint32_t data, uint32_t mem_mask = ~0);
++
++	void rxd_w(int state) { rx_w(state); }
++	void irq_pin_w(int line, int state);
++	void portc_pin_w(int bit, int state);
++	void set_pcmcia_pins(uint32_t pipr) { m_pipr = pipr; }   // PIPR: CD1/CD2 high = no card
++	uint32_t peek32(offs_t byteoff) const { return r32(byteoff); }
++	std::vector<uint8_t> spi_slave_transfer(const std::vector<uint8_t> &mosi);
++	int spi_slave_tx_len() const;
++	bool spi_slave_rx_ready() const;
++
++protected:
++	virtual void device_start() override ATTR_COLD;
++	virtual void device_reset() override ATTR_COLD;
++
++	virtual void nvram_default() override;
++	virtual bool nvram_read(util::read_stream &file) override;
++	virtual bool nvram_write(util::write_stream &file) override;
++
++	virtual void tra_callback() override;
++	virtual void tra_complete() override;
++	virtual void rcv_complete() override;
++
++private:
++	enum : uint32_t
++	{
++		SIPEND = 0x010, SIMASK = 0x014, SIEL = 0x018, SIVEC = 0x01c,
++		TBSCR = 0x200, RTCSC = 0x220, RTC = 0x224, PISCR = 0x240, PITC = 0x244, PITR = 0x248,
++		SCCR = 0x280, PLPRCR = 0x284,
++		CIVR = 0x930, CICR = 0x940, CIPR = 0x944, CIMR = 0x948, CISR = 0x94c,
++		PCDAT = 0x966, PCINT = 0x968,
++		TGCR = 0x980, TMR1 = 0x990, TER1 = 0x9b0,
++		CPCR = 0x9c0, BRGC1 = 0x9f0,
++		SMCMR1 = 0xa82, SMCE1 = 0xa86, SMCM1 = 0xa8a,
++		SPMODE = 0xaa0, SPIE = 0xaa6, SPIM = 0xaaa, SPCOM = 0xaad,
++		I2MOD = 0x860, I2COM = 0x86c, I2CER = 0x870, I2CMR = 0x874,
++		SMC1_PRAM = 0x3e80, SPI_PRAM = 0x3d80, I2C_PRAM = 0x3c80
++	};
++
++	enum : int
++	{
++		CPM_VEC_SMC1 = 0x04,
++		CPM_VEC_SPI = 0x05,
++		CPM_VEC_I2C = 0x10
++	};
++
++	devcb_write_line m_irq_cb;
++	devcb_write_line m_txd_cb;
++	devcb_read8 m_spi_cb;
++	devcb_write16 m_portc_out_cb;
++	devcb_read8 m_i2c_cb;
++	required_address_space m_mem;
++
++	uint8_t m_ram[0x4000];
++	emu_timer *m_pit_timer;
++	emu_timer *m_smc_timer;
++	emu_timer *m_cpm_timer[4];
++	emu_timer *m_rtc_timer;
++	emu_timer *m_i2c_timer;
++	uint32_t m_irq_pins;
++	uint32_t m_pipr = 0x00001800;
++	uint32_t m_cpm_edge;
++	uint16_t m_smc_rbptr;
++	uint16_t m_smc_tbptr;
++	uint16_t m_spi_rbptr;
++	uint16_t m_spi_tbptr;
++	uint16_t m_i2c_rbptr;
++	uint16_t m_i2c_tbptr;
++	bool m_smc_tx_busy;
++	bool m_irq_state;
++	FILE *m_echo;
++	uint32_t m_rtc_base;   // RTC minus emulated seconds; battery backed, survives resets
++	uint16_t m_rtcsc;      // RTCSC control bits, battery backed too
++	uint32_t m_logged[0x4000 / 32];
++
++	uint8_t r8(offs_t o) const { return m_ram[o & 0x3fff]; }
++	uint16_t r16(offs_t o) const { return (r8(o) << 8) | r8(o + 1); }
++	uint32_t r32(offs_t o) const { return (r16(o) << 16) | r16(o + 2); }
++	void w8(offs_t o, uint8_t v) { m_ram[o & 0x3fff] = v; }
++	void w16(offs_t o, uint16_t v) { w8(o, v >> 8); w8(o + 1, v); }
++	void w32(offs_t o, uint32_t v) { w16(o, v >> 16); w16(o + 2, v); }
++
++	void reg_written(offs_t byteoff, uint32_t old, uint32_t data, uint32_t mem_mask);
++	void smc_event(uint8_t ev);
++	void spi_event(uint8_t ev);
++	void i2c_event(uint8_t ev);
++	void i2c_transfer();
++	void cpm_command(uint16_t cmd);
++	void update_irq();
++	uint32_t cpm_pending() const;
++	uint32_t siu_pending();
++	void pit_reload();
++	TIMER_CALLBACK_MEMBER(pit_tick);
++	TIMER_CALLBACK_MEMBER(smc_poll);
++	TIMER_CALLBACK_MEMBER(cpm_timer_tick);
++	TIMER_CALLBACK_MEMBER(rtc_second);
++	TIMER_CALLBACK_MEMBER(i2c_done);
++	void cpm_timer_reload(int n);
++	offs_t cpm_timer_reg(int n, int reg) const;
++	void smc_update_rate();
++	void smc_try_transmit();
++	void spi_transfer();
++	uint32_t pitrtclk() const;
++};
++
++DECLARE_DEVICE_TYPE(MPC823_IMM, mpc823_imm_device)
++
++#endif // MAME_KODAK_MPC823_IMM_H
+diff --git a/src/mame/mame.lst b/src/mame/mame.lst
+index 3d207bfa..b4f3e86e 100644
+--- a/src/mame/mame.lst
++++ b/src/mame/mame.lst
+@@ -25605,6 +25605,9 @@ robie
+ @source:koei/pasogo.cpp
+ pasogo
+ 
++@source:kodak/dc260.cpp
++dc260
++
+ @source:konami/88games.cpp
+ 88games
+ hypsptsp
+-- 
+2.34.1
+

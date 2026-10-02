@@ -1,0 +1,5 @@
+patches/*.patch -text
+*.xz binary
+*.png binary
+*.sh text eol=lf
+*.lua text eol=lf
