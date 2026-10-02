@@ -72,6 +72,17 @@ The `.CXM` file next to an application makes the camera start it at power
 on; it is what Applications > Start writes before power cycling. The card
 image is written to, so start from a fresh copy to get it as built.
 
+## Windows
+
+`tools/build-mame-windows.sh` builds `digita.exe` with MSYS2 (MinGW64 gcc and
+a python.org Python 3). Pointing `GENERATED` at the `build/generated` folder
+of a Linux build of the same tree skips the layout compression, which takes
+about 40 minutes on Windows. Then, with the cards built on Linux or WSL,
+`tools/make-windows-package.sh` makes `build-win/DC260-Digita-Windows` with
+`CAMERA.bat`, `TETRIS.bat`, `DOOM.bat` and a README (`pack/`). The launchers
+open a window (never full screen). The Windows build gives the same screens
+as the Linux one, pixel for pixel.
+
 ## Keys
 
 | Key | Camera | In Doom |
